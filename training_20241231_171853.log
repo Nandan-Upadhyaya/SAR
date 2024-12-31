@@ -1,0 +1,14 @@
+2024-12-31 17:18:53,623 - INFO - Found 1 GPU(s)
+2024-12-31 17:18:53,623 - INFO - Enabled memory growth for GPU: PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')
+2024-12-31 17:18:54,277 - INFO - Physical GPUs: 1, Logical GPUs: 1
+2024-12-31 17:18:54,277 - INFO - Initializing DataLoader with parameters: image_size=128, batch_size=8, validation_split=0.2
+2024-12-31 17:18:54,277 - INFO - Starting to load dataset from ./Dataset
+2024-12-31 17:18:54,277 - INFO - Found 4 categories: ['agri', 'barrenland', 'grassland', 'urban']
+2024-12-31 17:18:54,292 - INFO - Found 4000 image pairs in category 'agri'
+2024-12-31 17:18:54,322 - INFO - Found 4000 image pairs in category 'barrenland'
+2024-12-31 17:18:54,365 - INFO - Found 4000 image pairs in category 'grassland'
+2024-12-31 17:18:54,393 - INFO - Found 4000 image pairs in category 'urban'
+2024-12-31 17:18:54,756 - INFO - Dataset pipeline setup completed in 0.48 seconds
+2024-12-31 17:18:59,669 - INFO - Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA GeForce RTX 3060 Laptop GPU, compute capability 8.6
+2024-12-31 17:18:59,671 - INFO - Total trainable parameters: 7,857,776

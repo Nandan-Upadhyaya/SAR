@@ -1,0 +1,31 @@
+2024-12-30 19:37:29,958 - INFO - Found 1 GPU(s)
+2024-12-30 19:37:29,958 - INFO - Enabled memory growth for GPU: PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')
+2024-12-30 19:37:29,959 - INFO - Initializing DataLoader with parameters: image_size=128, batch_size=16, validation_split=0.2
+2024-12-30 19:37:29,959 - INFO - Starting to load dataset from ./Dataset
+2024-12-30 19:37:29,960 - INFO - Found 4 categories: ['agri', 'barrenland', 'grassland', 'urban']
+2024-12-30 19:37:29,973 - INFO - Found 4000 image pairs in category 'agri'
+2024-12-30 19:37:30,003 - INFO - Found 4000 image pairs in category 'barrenland'
+2024-12-30 19:37:30,031 - INFO - Found 4000 image pairs in category 'grassland'
+2024-12-30 19:37:30,060 - INFO - Found 4000 image pairs in category 'urban'
+2024-12-30 19:37:31,062 - INFO - Dataset pipeline setup completed in 1.10 seconds
+2024-12-30 19:37:35,586 - INFO - Total trainable parameters: 18,124,688
+2024-12-30 19:42:41,177 - INFO - Validation - Cycle Loss: 7.0741, PSNR Color: 12.37, PSNR SAR: 15.11, SSIM Color: 0.0760, SSIM SAR: 0.0756
+2024-12-30 19:42:41,429 - INFO - Model saved successfully to ./output\checkpoint_best
+2024-12-30 19:42:41,680 - INFO - Model saved successfully to ./output\checkpoint_best
+2024-12-30 19:42:41,683 - INFO - Saved best checkpoint at epoch 1
+2024-12-30 19:42:41,683 - INFO - Epoch 1 - gen_loss: 14.6547 - disc_loss: 2.6637 - cycle_loss: 6.9777 - cls_loss: 2.7795
+2024-12-30 19:47:30,431 - INFO - Validation - Cycle Loss: 5.9348, PSNR Color: 14.13, PSNR SAR: 16.05, SSIM Color: 0.1018, SSIM SAR: 0.0891
+2024-12-30 19:47:30,665 - INFO - Model saved successfully to ./output\checkpoint_best
+2024-12-30 19:47:30,917 - INFO - Model saved successfully to ./output\checkpoint_best
+2024-12-30 19:47:30,920 - INFO - Saved best checkpoint at epoch 2
+2024-12-30 19:47:30,920 - INFO - Epoch 2 - gen_loss: 12.8129 - disc_loss: 2.4539 - cycle_loss: 5.6627 - cls_loss: 2.7915
+2024-12-30 19:52:20,329 - INFO - Validation - Cycle Loss: 5.3184, PSNR Color: 15.17, PSNR SAR: 16.74, SSIM Color: 0.1363, SSIM SAR: 0.1021
+2024-12-30 19:52:20,561 - INFO - Model saved successfully to ./output\checkpoint_best
+2024-12-30 19:52:20,816 - INFO - Model saved successfully to ./output\checkpoint_best
+2024-12-30 19:52:20,819 - INFO - Saved best checkpoint at epoch 3
+2024-12-30 19:52:20,820 - INFO - Epoch 3 - gen_loss: 11.9689 - disc_loss: 2.4413 - cycle_loss: 4.9850 - cls_loss: 2.8158
+2024-12-30 19:57:10,559 - INFO - Validation - Cycle Loss: 5.1424, PSNR Color: 15.56, PSNR SAR: 16.96, SSIM Color: 0.1695, SSIM SAR: 0.1078
+2024-12-30 19:57:10,783 - INFO - Model saved successfully to ./output\checkpoint_best
+2024-12-30 19:57:11,040 - INFO - Model saved successfully to ./output\checkpoint_best
+2024-12-30 19:57:11,042 - INFO - Saved best checkpoint at epoch 4
+2024-12-30 19:57:11,043 - INFO - Epoch 4 - gen_loss: 11.5216 - disc_loss: 2.5384 - cycle_loss: 4.7599 - cls_loss: 2.7715

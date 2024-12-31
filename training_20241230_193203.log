@@ -1,0 +1,11 @@
+2024-12-30 19:32:03,092 - INFO - Found 1 GPU(s)
+2024-12-30 19:32:03,092 - INFO - Enabled memory growth for GPU: PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')
+2024-12-30 19:32:03,093 - INFO - Initializing DataLoader with parameters: image_size=128, batch_size=16, validation_split=0.2
+2024-12-30 19:32:03,093 - INFO - Starting to load dataset from ./Dataset
+2024-12-30 19:32:03,093 - INFO - Found 4 categories: ['agri', 'barrenland', 'grassland', 'urban']
+2024-12-30 19:32:03,111 - INFO - Found 4000 image pairs in category 'agri'
+2024-12-30 19:32:03,163 - INFO - Found 4000 image pairs in category 'barrenland'
+2024-12-30 19:32:03,203 - INFO - Found 4000 image pairs in category 'grassland'
+2024-12-30 19:32:03,259 - INFO - Found 4000 image pairs in category 'urban'
+2024-12-30 19:32:05,435 - INFO - Dataset pipeline setup completed in 2.34 seconds
+2024-12-30 19:32:13,617 - INFO - Total trainable parameters: 18,124,688
