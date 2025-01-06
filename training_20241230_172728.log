@@ -1,9 +1,0 @@
-2024-12-30 17:27:28,670 - WARNING - No GPUs found. Running on CPU
-2024-12-30 17:27:28,670 - INFO - Initializing DataLoader with parameters: image_size=128, batch_size=16, validation_split=0.2
-2024-12-30 17:27:28,671 - INFO - Starting to load dataset from ./Dataset
-2024-12-30 17:27:28,671 - INFO - Found 4 categories: ['agri', 'barrenland', 'grassland', 'urban']
-2024-12-30 17:27:28,690 - INFO - Found 4000 image pairs in category 'agri'
-2024-12-30 17:27:28,735 - INFO - Found 4000 image pairs in category 'barrenland'
-2024-12-30 17:27:28,778 - INFO - Found 4000 image pairs in category 'grassland'
-2024-12-30 17:27:28,828 - INFO - Found 4000 image pairs in category 'urban'
-2024-12-30 17:27:29,307 - INFO - Dataset pipeline setup completed in 0.64 seconds
