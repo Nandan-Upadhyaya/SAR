@@ -618,7 +618,7 @@ class CycleGAN:
             
         disc_opt_weights_path = os.path.join(save_dir, 'disc_optimizer_weights.npy')
         if os.path.exists(disc_opt_weights_path):
-            with open(dc_opt_weights_path, 'rb') as f:
+            with open(disc_opt_weights_path, 'rb') as f:
                 weight_values = np.load(f, allow_pickle=True)
             model.disc_optimizer.set_weights(weight_values)
         
@@ -1147,13 +1147,13 @@ def main():
     config = {
         'image_size': 128,  # Reduced from 256
         'batch_size': 8,     # Reduced batch size for stability
-        'epochs': 10,       # Reduced epochs with better scheduling
+        'epochs': 50,       # Reduced epochs with better scheduling
         'dataset_dir': './Dataset',
         'output_dir': './output',
         'learning_rate': 2e-4,
         'lambda_cyc': 5.0,
-        'lambda_cls': 0.3,
-        'early_stopping_patience': 12,
+        'lambda_cls': 0.5,
+        'early_stopping_patience': 10,
         'validation_split': 0.2,
         'cache_dataset': True  # Enable dataset caching for faster training
     }
