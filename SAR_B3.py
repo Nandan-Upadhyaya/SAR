@@ -458,7 +458,7 @@ class CycleGAN:
         image_size: int,
         num_classes: int,
         lambda_cyc: float = 5.0,    # Reduced from 8.0 to get cycle loss < 1
-        lambda_cls: float = 0.3,    # Reduced from 0.5 to get cls loss < 0.5
+        lambda_cls: float = 0.6,    # Reduced from 0.5 to get cls loss < 0.5
         learning_rate: float = 2e-4  # Slightly increased for faster convergence
     ):
         self.G1 = Generator(image_size)
