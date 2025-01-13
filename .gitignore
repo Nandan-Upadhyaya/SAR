@@ -2,3 +2,5 @@ Dataset/
 *.log
 logs/
 output/
+tuning/
+__pycache__/
