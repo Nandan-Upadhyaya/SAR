@@ -1273,13 +1273,13 @@ def main():
     # Optimized parameters for RTX 3060 Mobile
     config = {
         'image_size': 128,  # Reduced from 256
-        'batch_size': 8,     # Reduced batch size for stability
+        'batch_size': 32,     # Reduced batch size for stability
         'epochs': 100,       # Reduced epochs with better scheduling
         'dataset_dir': './Dataset',
         'output_dir': './output_1',
         'learning_rate': 2e-4,
         'lambda_cyc': 5.0,
-        'lambda_cls': 0.5,
+        'lambda_cls': 0.3,
         'early_stopping_patience': 7,
         'validation_split': 0.2,
         'cache_dataset': True  # Enable dataset caching for faster training
