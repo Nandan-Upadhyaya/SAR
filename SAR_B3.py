@@ -884,6 +884,8 @@ class CycleGAN:
         gradients = tape.gradient(pred, interpolated)
         slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1, 2, 3]))
         return tf.reduce_mean(tf.square(slopes - 1.0))
+    
+    
 
 class Trainer:
     def __init__(

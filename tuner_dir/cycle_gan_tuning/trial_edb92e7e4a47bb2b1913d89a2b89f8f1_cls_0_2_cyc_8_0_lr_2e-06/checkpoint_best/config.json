@@ -1,0 +1,1 @@
+{"lambda_cyc": 8.0, "lambda_cls": 0.2, "learning_rate_config": {"initial_learning_rate": 2e-06, "decay_steps": 1000, "decay_rate": 0.96, "type": "ExponentialDecay"}}
