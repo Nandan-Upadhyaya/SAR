@@ -457,8 +457,8 @@ class CycleGAN:
         self,
         image_size: int,
         num_classes: int,
-        lambda_cyc: float = 5.0,    # Reduced from 8.0 to get cycle loss < 1
-        lambda_cls: float = 0.5,    # Reduced from 0.5 to get cls loss < 0.5
+        lambda_cyc: float = 6.0,    # Reduced from 8.0 to get cycle loss < 1
+        lambda_cls: float = 0.3,    # Reduced from 0.5 to get cls loss < 0.5
         learning_rate: float = 2e-4  # Slightly increased for faster convergence
     ):
         self.G1 = Generator(image_size)
@@ -894,8 +894,9 @@ class Trainer:
         train_ds: tf.data.Dataset,
         val_ds: tf.data.Dataset,
         output_dir: str,
-        epochs: int = 100,
-        early_stopping_patience: int = 5
+        epochs: int = 200,
+        early_stopping_patience: int = 7,
+        initial_epoch: int = 0  
     ):
         self.model = model
         self.train_ds = train_ds
@@ -903,6 +904,7 @@ class Trainer:
         self.output_dir = output_dir
         self.epochs = epochs
         self.early_stopping_patience = early_stopping_patience
+        self.initial_epoch = initial_epoch  # Store the initial epoch
         
         self.val_gen_loss_metric = tf.keras.metrics.Mean()
         self.val_disc_loss_metric = tf.keras.metrics.Mean()
@@ -1277,7 +1279,7 @@ class Trainer:
 
     def train(self):
         """Execute training loop with validation and early stopping."""
-        for epoch in range(self.epochs):
+        for epoch in range(self.initial_epoch, self.initial_epoch + self.epochs):
             start_time = time.time()
             
             # Training loop
@@ -1308,7 +1310,7 @@ class Trainer:
                 
             # Log progress
             logger.info(
-                f"Epoch {epoch + 1}/{self.epochs} completed in "
+                f"Epoch {epoch + 1}/{self.initial_epoch + self.epochs} completed in "
                 f"{time.time() - start_time:.2f}s"
             )
             self.metrics_logger.log_epoch(epoch)
@@ -1348,12 +1350,12 @@ def main():
     # Optimized parameters for RTX 3060 Mobile
     config = {
         'image_size': 128,  # Reduced from 256
-        'batch_size': 8,     # Reduced batch size for stability
-        'epochs': 100,       # Reduced epochs with better scheduling
+        'batch_size': 16,     # Reduced batch size for stability
+        'epochs': 200,       # Reduced epochs with better scheduling
         'dataset_dir': './Dataset',
         'output_dir': './output',
-        'learning_rate': 2e-5,
-        'lambda_cyc': 5.0,
+        'learning_rate': 2e-4,
+        'lambda_cyc': 6.0,
         'lambda_cls': 0.3,
         'early_stopping_patience': 7,
         'validation_split': 0.2,

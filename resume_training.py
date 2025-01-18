@@ -1,123 +1,99 @@
-import tensorflow as tf
-from SAR_B3 import CycleGAN, DataLoader, GPUConfig, Trainer
 import os
-import logging
-from datetime import datetime
+import json
+import numpy as np
+import tensorflow as tf
+from SAR_B3 import GPUConfig, logger,DataLoader, CycleGAN, Trainer
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f'resume_training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+def resume_training(checkpoint_epoch=80, total_epochs=200):
+    # Load original configuration
+    with open('./output/config.json', 'r') as f:
+        config = json.load(f)
+    
+    # Create new output directory for resumed training
+    config['output_dir'] = './output_resumed'
+    
+    # Adjust epochs for remaining training
+    config['epochs'] = total_epochs  # Set the total desired epochs
+    remaining_epochs = total_epochs - checkpoint_epoch  
 
-def resume_training(checkpoint_dir: str):
-    """Resume training from a saved checkpoint."""
-    try:
-        # Configure GPU and set memory growth
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        if gpus:
+    # Save new configuration
+    os.makedirs(config['output_dir'], exist_ok=True)
+    with open(os.path.join(config['output_dir'], 'config.json'), 'w') as f:
+        json.dump(config, f, indent=4)
+    
+    # Configure GPU
+    GPUConfig.configure()
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            logger.info(f"Found {len(gpus)} GPU(s)")
-            
-            # Force TensorFlow to use GPU
-            strategy = tf.distribute.OneDeviceStrategy("/GPU:0")
-            with strategy.scope():
-                # Load configuration from the original training
-                config_path = os.path.join(os.path.dirname(checkpoint_dir), 'config.json')
-                if not os.path.exists(config_path):
-                    raise FileNotFoundError(f"Config file not found at {config_path}")
-                    
-                with open(config_path, 'r') as f:
-                    import json
-                    config = json.load(f)
-                
-                # First create the model and initialize it
-                model = CycleGAN(
-                    config['image_size'],
-                    len(os.listdir(config['dataset_dir'])),  # num_classes
-                    config['lambda_cyc'],
-                    config['lambda_cls'],
-                    config['learning_rate']
-                )
-                
-                # Build the model first with dummy inputs
-                dummy_input = tf.zeros((1, config['image_size'], config['image_size'], 3))
-                _ = model.G1(dummy_input)
-                _ = model.G2(dummy_input)
-                _ = model.D1(dummy_input)
-                _ = model.D2(dummy_input)
-                
-                # Load the weights after model is built
-                model.G1.load_weights(os.path.join(checkpoint_dir, 'generator1.h5'))
-                model.G2.load_weights(os.path.join(checkpoint_dir, 'generator2.h5'))
-                model.D1.load_weights(os.path.join(checkpoint_dir, 'discriminator1.h5'))
-                model.D2.load_weights(os.path.join(checkpoint_dir, 'discriminator2.h5'))
-                
-                # Compile model
-                model.compile()
-                
-                # Now initialize data loader with strategy
-                data_loader = DataLoader(
-                    config['dataset_dir'],
-                    config['image_size'],
-                    config['batch_size'],
-                    config['validation_split']
-                )
-                
-                train_ds, val_ds = data_loader.load_data()
-                
-                # Create new output directory for resumed training
-                new_output_dir = f"./resumed_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                os.makedirs(new_output_dir, exist_ok=True)
-                
-                # Create trainer instance with initialized model
-                trainer = Trainer(
-                    model,
-                    train_ds,
-                    val_ds,
-                    new_output_dir,
-                    config['epochs'],
-                    config['early_stopping_patience']
-                )
-                
-                # Load training state
-                if os.path.exists(os.path.join(checkpoint_dir, 'training_state.json')):
-                    with open(os.path.join(checkpoint_dir, 'training_state.json'), 'r') as f:
-                        training_state = json.load(f)
-                        trainer.patience_counter = training_state.get('patience_counter', 0)
-                        trainer.val_gen_loss_metric.reset_states()
-                        trainer.val_gen_loss_metric.update_state(training_state.get('best_val_loss', float('inf')))
-                
-                # Resume training
-                logger.info("Resuming training...")
-                trainer.train()
-        else:
-            raise RuntimeError("No GPU available for training")
-            
-    except Exception as e:
-        logger.error(f"Failed to resume training: {str(e)}")
-        raise
+            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+            logger.info(f"Physical GPUs: {len(gpus)}, Logical GPUs: {len(logical_gpus)}")
+        except RuntimeError as e:
+            logger.error(f"Memory growth setup failed: {str(e)}")
+
+    # Initialize DataLoader with same configuration
+    data_loader = DataLoader(
+        config['dataset_dir'],
+        config['image_size'],
+        config['batch_size'],
+        config['validation_split']
+    )
+    train_ds, val_ds = data_loader.load_data()
+    
+    # Load checkpoint configuration
+    checkpoint_path = os.path.join('./output', f'checkpoint_epoch_{checkpoint_epoch}')
+    if not os.path.exists(checkpoint_path):
+        raise ValueError(f"Checkpoint at epoch {checkpoint_epoch} not found in {checkpoint_path}")
+    
+    with open(os.path.join(checkpoint_path, 'config.json'), 'r') as f:
+        checkpoint_config = json.load(f)
+    
+    # Initialize model with the original learning rate value
+    learning_rate = checkpoint_config.get('learning_rate_config', {}).get('value', 2e-4)
+    
+    logger.info(f"Loading checkpoint from epoch {checkpoint_epoch}")
+    model = CycleGAN(
+        image_size=config['image_size'],
+        num_classes=data_loader.num_classes,
+        lambda_cyc=checkpoint_config.get('lambda_cyc', 5.0),
+        lambda_cls=checkpoint_config.get('lambda_cls', 0.5),
+        learning_rate=learning_rate  # Pass the scalar learning rate
+    )
+    
+    model.compile()
+
+    # Load weights
+    model.G1.load_weights(os.path.join(checkpoint_path, 'generator1.h5'))
+    model.G2.load_weights(os.path.join(checkpoint_path, 'generator2.h5'))
+    model.D1.load_weights(os.path.join(checkpoint_path, 'discriminator1.h5'))
+    model.D2.load_weights(os.path.join(checkpoint_path, 'discriminator2.h5'))
+    
+    # Log model parameters
+    total_params = np.sum([
+        np.prod(v.get_shape().as_list()) 
+        for v in model.G1.trainable_variables + 
+                 model.G2.trainable_variables +
+                 model.D1.trainable_variables + 
+                 model.D2.trainable_variables
+    ])
+    logger.info(f"Total trainable parameters: {total_params:,}")
+    
+    # Initialize trainer with remaining epochs
+    trainer = Trainer(
+        model,
+        train_ds,
+        val_ds,
+        config['output_dir'],
+        config['epochs'],
+        config['early_stopping_patience'],
+        initial_epoch=checkpoint_epoch
+    )
+    
+    # Resume training
+    logger.info(f"Resuming training from epoch {checkpoint_epoch} for {remaining_epochs} epochs")
+    trainer.train()
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Resume CycleGAN training from checkpoint')
-    parser.add_argument('--checkpoint_dir', 
-                       type=str,
-                       default='./output/checkpoint_best',
-                       help='Path to checkpoint directory')
-    
-    args = parser.parse_args()
-    
-    # Check if checkpoint directory exists
-    if not os.path.exists(args.checkpoint_dir):
-        raise FileNotFoundError(f"Checkpoint directory not found: {args.checkpoint_dir}")
-        
-    logger.info(f"Starting resume process from checkpoint: {args.checkpoint_dir}")
-    resume_training(args.checkpoint_dir)
+    resume_training(checkpoint_epoch=80, total_epochs=200)

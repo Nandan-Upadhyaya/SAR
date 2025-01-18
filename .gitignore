@@ -6,3 +6,6 @@ tuning/
 __pycache__/
 _/
 tuner_results/
+cycle_gan_tuning/
+tuner_dir_1/
+output_resumed/
