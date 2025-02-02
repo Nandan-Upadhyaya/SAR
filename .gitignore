@@ -1,3 +1,15 @@
 Dataset/
 output/
 *.log
+*.png
+hp_tuning/
+logs/
+output_resumed_190/
+tuner_results/
+test/
+tuner_dir/
+tuner_dir_1/
+output_updatedSAR/
+.1/
+_1/
+__pycache__/

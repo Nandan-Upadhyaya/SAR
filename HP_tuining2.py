@@ -2,8 +2,31 @@ import keras_tuner as kt
 from SAR_B3 import CycleGAN, DataLoader, Trainer, GPUConfig, logger
 import tensorflow as tf
 import os
-import json
-from datetime import datetime
+
+# Configure GPU settings
+def configure_gpu():
+    """Configure GPU settings for optimal performance."""
+    try:
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            
+            # Set TensorFlow to only use first GPU
+            tf.config.set_visible_devices(gpus[0], 'GPU')
+            tf.config.experimental.set_virtual_device_configuration(
+                gpus[0],
+                [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4096)]
+            )
+            logger.info("GPU configured successfully")
+        else:
+            logger.warning("No GPU devices found")
+    except RuntimeError as e:
+        logger.error(f"GPU configuration error: {str(e)}")
+        raise
+
+# Call GPU configuration before model creation
+configure_gpu()
 
 class CycleGANHyperModel(kt.HyperModel):
     """HyperModel for CycleGAN to define the model architecture and hyperparameters."""
@@ -30,24 +53,21 @@ class CycleGANHyperModel(kt.HyperModel):
         )
         model.compile()
         
-        # Create a wrapper Keras model
+        # Create a wrapper Keras model that represents the CycleGAN
         class KerasWrapper(tf.keras.Model):
             def __init__(self, cycle_gan):
                 super().__init__()
                 self.cycle_gan = cycle_gan
                 
             def call(self, inputs):
+                # Dummy forward pass - not actually used for training
                 return self.cycle_gan.G1(inputs)
         
         return KerasWrapper(model)
 
 class CycleGANTuner(kt.Tuner):
-    """Custom tuner for CycleGAN with resume capability."""
+    """Custom tuner for CycleGAN to handle the complex training process."""
     
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.best_trial_summary = None
-        
     def run_trial(self, trial, *args, **kwargs):
         """Execute a trial with given hyperparameters."""
         hp = trial.hyperparameters
@@ -59,7 +79,7 @@ class CycleGANTuner(kt.Tuner):
         # Create trainer for this trial
         output_dir = os.path.join(
             self.project_dir,
-            f"trial__{trial.trial_id}_cls_{hp.get('lambda_cls')}_cyc_{hp.get('lambda_cyc')}_lr_{hp.get('learning_rate')}".replace('.', '_')
+            f"trial_{trial.trial_id}_cls_{hp.get('lambda_cls')}_cyc_{hp.get('lambda_cyc')}_lr_{hp.get('learning_rate')}".replace('.', '_')
         )
         
         trainer = Trainer(
@@ -74,7 +94,7 @@ class CycleGANTuner(kt.Tuner):
         # Train the model
         trainer.train()
         
-        # Calculate metrics
+        # Calculate weighted validation metrics
         metrics = {
             'cycle_loss': float(trainer.val_cycle_loss_metric.result()),
             'gen_loss': float(trainer.val_gen_loss_metric.result()),
@@ -97,130 +117,61 @@ class CycleGANTuner(kt.Tuner):
             metrics['fid_score'] * 0.1 +
             metrics['l1_loss'] * 0.05 +
             metrics['l2_loss'] * 0.05 +
-            (10.0 - metrics['inception_score']) * 0.05
+            (10.0 - metrics['inception_score']) * 0.05  # Convert inception score to loss
         )
 
         metrics['weighted_score'] = weighted_score
         
-        # Save trial summary
-        trial_summary = {
-            'trial_id': trial.trial_id,
-            'hyperparameters': hp.values,
-            'metrics': metrics,
-            'weighted_score': weighted_score,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # Save to file
-        summary_path = os.path.join(output_dir, 'trial_summary.json')
-        with open(summary_path, 'w') as f:
-            json.dump(trial_summary, f, indent=2)
-        
-        # Update best trial if necessary
-        if self.best_trial_summary is None or weighted_score < self.best_trial_summary['weighted_score']:
-            self.best_trial_summary = trial_summary
-            
-            # Save best trial summary
-            best_summary_path = os.path.join(self.project_dir, 'best_trial_summary.json')
-            with open(best_summary_path, 'w') as f:
-                json.dump(self.best_trial_summary, f, indent=2)
-        
-        # Update oracle
+        # Log all metrics
         self.oracle.update_trial(trial.trial_id, metrics)
         
+        # Return the weighted score for optimization
         return weighted_score
 
-def load_best_trial(project_dir):
-    """Load the best trial summary if it exists."""
-    best_summary_path = os.path.join(project_dir, 'best_trial_summary.json')
-    if os.path.exists(best_summary_path):
-        try:
-            with open(best_summary_path, 'r') as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            logger.warning("Could not parse best trial summary file")
-            return None
-        except Exception as e:
-            logger.warning(f"Error loading best trial summary: {str(e)}")
-            return None
-    return None
-
-def tuner_pipeline(resume=True):
-    """Execute the hyperparameter tuning pipeline with resume capability."""
-    # GPU configuration
-    GPUConfig.configure()
-    
-    # Configuration
-    dataset_dir = "./Dataset"
-    image_size = 128
-    num_classes = 4
-    epochs = 5
-    project_dir = './tuner_dir_1'
-    project_name = 'cycle_gan_tuning_1'
-    max_trials = 30
-    
-    # Data loading
-    data_loader = DataLoader(
-        dataset_dir=dataset_dir,
-        image_size=image_size,
-        batch_size=16,
-        validation_split=0.2
-    )
-    train_ds, val_ds = data_loader.load_data()
-    
-    # Create hypermodel
-    hypermodel = CycleGANHyperModel(image_size=image_size, num_classes=num_classes)
-    
-    # Load existing tuner if resuming
-    if resume and os.path.exists(os.path.join(project_dir, project_name)):
-        logger.info("Resuming existing tuning session...")
-        # First create a new tuner instance with the same configuration
-        tuner = CycleGANTuner(
-            hypermodel=hypermodel,
-            oracle=kt.oracles.BayesianOptimization(
-                objective=kt.Objective('weighted_score', direction='min'),
-                max_trials=max_trials
-            ),
-            directory=project_dir,
-            project_name=project_name,
-            overwrite=False
-        )
-        # Then reload the tuner state
-        tuner.reload()
+def tuner_pipeline():
+    """Execute the hyperparameter tuning pipeline."""
+    try:
+        # Ensure GPU is properly configured
+        configure_gpu()
         
-        # Load best trial summary
-        best_trial = load_best_trial(os.path.join(project_dir, project_name))
-        if best_trial:
-            tuner.best_trial_summary = best_trial
-            logger.info(f"Loaded best trial with score: {best_trial['weighted_score']}")
-            logger.info(f"Best hyperparameters so far: {best_trial['hyperparameters']}")
-    else:
-        logger.info("Starting new tuning session...")
+        # GPU configuration
+        GPUConfig.configure()
+        
+        # Data loading
+        dataset_dir = "./Dataset"
+        image_size = 128
+        num_classes = 4
+        epochs = 5
+        
+        data_loader = DataLoader(
+            dataset_dir=dataset_dir,
+            image_size=image_size,
+            batch_size=8,
+            validation_split=0.2
+        )
+        train_ds, val_ds = data_loader.load_data()
+        
+        # Create hypermodel
+        hypermodel = CycleGANHyperModel(image_size=image_size, num_classes=num_classes)
+        
+        # Create custom tuner
         tuner = CycleGANTuner(
             hypermodel=hypermodel,
             oracle=kt.oracles.BayesianOptimization(
                 objective=kt.Objective('weighted_score', direction='min'),
-                max_trials=max_trials
+                max_trials=30
             ),
-            directory=project_dir,
-            project_name=project_name,
-            overwrite=False
+            directory='./tuner_dir',
+            project_name='cycle_gan_tuning',
+            overwrite=True
         )
-    
-    # Add required attributes for training
-    tuner.train_ds = train_ds
-    tuner.val_ds = val_ds
-    tuner.epochs = epochs
-    
-    # Get current trial count
-    completed_trials = len(tuner.oracle.trials)
-    remaining_trials = max_trials - completed_trials
-    
-    logger.info(f"Completed trials: {completed_trials}")
-    logger.info(f"Remaining trials: {remaining_trials}")
-    
-    if remaining_trials > 0:
-        # Continue the search
+        
+        # Add required attributes for training
+        tuner.train_ds = train_ds
+        tuner.val_ds = val_ds
+        tuner.epochs = epochs
+        
+        # Start the search
         tuner.search()
         
         # Get best hyperparameters
@@ -247,8 +198,14 @@ def tuner_pipeline(resume=True):
         os.makedirs(best_model_dir, exist_ok=True)
         best_model.save(best_model_dir)
         logger.info(f"\nBest model saved to: {best_model_dir}")
-    else:
-        logger.info("All trials completed. No more trials to run.")
+    
+    except Exception as e:
+        logger.error(f"Pipeline failed: {str(e)}")
+        raise
 
 if __name__ == "__main__":
-    tuner_pipeline(resume=True)
+    try:
+        tuner_pipeline()
+    except Exception as e:
+        logger.error(f"Application failed: {str(e)}")
+        raise

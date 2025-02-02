@@ -512,8 +512,8 @@ class CycleGAN:
             cycled_sar = self.G2([fake_optical, optical_mask])  # Ensure inputs are properly processed
 
             # Backward cycle (Optical → SAR → Optical)
-            fake_sar = self.G2([real_optical, optical_mask])
-            cycled_optical = self.G1([fake_sar, sar_mask])
+            fake_sar = self.G2(tf.concat([real_optical, optical_mask], axis=-1))
+            cycled_optical = self.G1(tf.concat([fake_sar, sar_mask], axis=-1))
             
             # Discriminator outputs for real and fake images
             disc_real_optical_adv, disc_real_optical_cls = self.D1(real_optical)
@@ -698,17 +698,17 @@ class Trainer:
             cycled_optical = self.model.G1([fake_sar, optical_mask]) # SAR back to Optical
 
             # Discriminator outputs for real/fake classification
-            disc_real_optical_adv, disc_real_optical_cls = self.model.D1(real_optical)
-            disc_fake_optical_adv, disc_fake_optical_cls = self.model.D1(fake_optical)
-            disc_real_sar_adv, disc_real_sar_cls = self.model.D2(real_sar)
-            disc_fake_sar_adv, disc_fake_sar_cls = self.model.D2(fake_sar)
+            disc_real_optical = self.model.D1(real_optical)
+            disc_fake_optical = self.model.D1(fake_optical)
+            disc_real_sar = self.model.D2(real_sar)
+            disc_fake_sar = self.model.D2(fake_sar)
 
             # Calculate losses according to paper
             # Adversarial losses
-            gen_loss_optical = tf.reduce_mean(tf.square(disc_fake_optical_adv - 1))
-            gen_loss_sar = tf.reduce_mean(tf.square(disc_fake_sar_adv - 1))
-            disc_loss_optical = tf.reduce_mean(tf.square(disc_real_optical_adv - 1) + tf.square(disc_fake_optical_adv))
-            disc_loss_sar = tf.reduce_mean(tf.square(disc_real_sar_adv - 1) + tf.square(disc_fake_sar_adv))
+            gen_loss_optical = tf.reduce_mean(tf.square(disc_fake_optical - 1))
+            gen_loss_sar = tf.reduce_mean(tf.square(disc_fake_sar - 1))
+            disc_loss_optical = tf.reduce_mean(tf.square(disc_real_optical - 1) + tf.square(disc_fake_optical))
+            disc_loss_sar = tf.reduce_mean(tf.square(disc_real_sar - 1) + tf.square(disc_fake_sar))
 
             # Cycle consistency losses
             cycle_loss_sar = tf.reduce_mean(tf.abs(real_sar - cycled_sar))
@@ -716,12 +716,12 @@ class Trainer:
             cycle_loss = cycle_loss_sar + cycle_loss_optical
 
             # Domain classification losses for real images
-            real_cls_loss_optical = self._domain_classification_loss(disc_real_optical_cls, optical_mask)
-            real_cls_loss_sar = self._domain_classification_loss(disc_real_sar_cls, sar_mask)
+            real_cls_loss_optical = self._domain_classification_loss(disc_real_optical, optical_mask)
+            real_cls_loss_sar = self._domain_classification_loss(disc_real_sar, sar_mask)
             
             # Domain classification losses for fake images
-            fake_cls_loss_optical = self._domain_classification_loss(disc_fake_optical_cls, optical_mask)
-            fake_cls_loss_sar = self._domain_classification_loss(disc_fake_sar_cls, sar_mask)
+            fake_cls_loss_optical = self._domain_classification_loss(disc_fake_optical, optical_mask)
+            fake_cls_loss_sar = self._domain_classification_loss(disc_fake_sar, sar_mask)
 
             # Total losses
             gen_total_loss = (gen_loss_optical + gen_loss_sar + 
@@ -764,10 +764,9 @@ class Trainer:
         }
 
     def _domain_classification_loss(self, disc_output, target_domain):
-        target_domain = tf.reduce_max(target_domain, axis=[1, 2])
+        """Calculate domain classification loss as per paper"""
         return tf.reduce_mean(tf.keras.losses.categorical_crossentropy(
-            target_domain, disc_output
-        ))
+            target_domain, disc_output, from_logits=True))
 
     def train(self):
         """Execute training loop following MC-GAN methodology"""
@@ -775,8 +774,8 @@ class Trainer:
             start_time = time.time()
             
             # Training loop
-            for (sar_img, sar_mask), (opt_img, opt_mask) in self.train_ds:
-                metrics = self._train_step(sar_img, opt_img, sar_mask, opt_mask)
+            for (real_optical, real_sar), (optical_mask, sar_mask) in self.train_ds:
+                metrics = self._train_step(real_sar, real_optical, sar_mask, optical_mask)
                 
             # Log progress
             logger.info(
@@ -806,8 +805,8 @@ class Trainer:
     def _save_samples(self, epoch):
         """Save sample images during training"""
         sample_batch = next(iter(self.val_ds))
-        (sar_img, sar_mask), (opt_img, opt_mask) = sample_batch
-        metrics = self._train_step(sar_img, opt_img, sar_mask, opt_mask)
+        (real_optical, real_sar), (optical_mask, sar_mask) = sample_batch
+        metrics = self._train_step(real_sar, real_optical, sar_mask, optical_mask)
         
         if 'generated_images' in metrics:
             fake_optical, fake_sar, cycled_optical, cycled_sar = metrics['generated_images']
@@ -815,8 +814,8 @@ class Trainer:
             plt.figure(figsize=(15, 10))
             titles = ['Real Optical', 'Fake SAR', 'Cycled Optical',
                      'Real SAR', 'Fake Optical', 'Cycled SAR']
-            images = [opt_img[0], fake_sar[0], cycled_optical[0],
-                     sar_img[0], fake_optical[0], cycled_sar[0]]
+            images = [real_optical[0], fake_sar[0], cycled_optical[0],
+                     real_sar[0], fake_optical[0], cycled_sar[0]]
             
             for i, (img, title) in enumerate(zip(images, titles)):
                 plt.subplot(2, 3, i + 1)

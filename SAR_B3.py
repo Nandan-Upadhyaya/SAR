@@ -458,7 +458,7 @@ class CycleGAN:
         image_size: int,
         num_classes: int,
         lambda_cyc: float = 5.0,    # Reduced from 8.0 to get cycle loss < 1
-        lambda_cls: float = 0.6,    # Reduced from 0.5 to get cls loss < 0.5
+        lambda_cls: float = 0.5,    # Reduced from 0.5 to get cls loss < 0.5
         learning_rate: float = 2e-4  # Slightly increased for faster convergence
     ):
         self.G1 = Generator(image_size)
@@ -492,9 +492,12 @@ class CycleGAN:
             self.disc_scheduler, beta_1=0.5
         )
         
-        # Enable mixed precision training
-        self.mixed_precision = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(self.mixed_precision)
+        # Remove mixed precision
+        # self.mixed_precision = tf.keras.mixed_precision.Policy('mixed_float16')
+        # tf.keras.mixed_precision.set_global_policy(self.mixed_precision)
+        
+        # Set compute dtype explicitly
+        self.compute_dtype = tf.float32
         
         # Adaptive learning rate schedule
         self.gen_scheduler = tf.keras.optimizers.schedules.CosineDecayRestarts(
@@ -612,10 +615,10 @@ class CycleGAN:
         )
         
          # Load model weights
-        model.G1.load_weights(os.path.join(save_dir, 'generator1_weights.h5'))
-        model.G2.load_weights(os.path.join(save_dir, 'generator2_weights.h5'))
-        model.D1.load_weights(os.path.join(save_dir, 'discriminator1_weights.h5'))
-        model.D2.load_weights(os.path.join(save_dir, 'discriminator2_weights.h5'))
+        model.G1.load_weights(os.path.join(save_dir, 'generator1.h5'))
+        model.G2.load_weights(os.path.join(save_dir, 'generator2.h5'))
+        model.D1.load_weights(os.path.join(save_dir, 'discriminator1.h5'))
+        model.D2.load_weights(os.path.join(save_dir, 'discriminator2.h5'))
         
         # Load optimizer weights if they exist
         gen_opt_weights_path = os.path.join(save_dir, 'gen_optimizer_weights.npy')
@@ -641,6 +644,11 @@ class CycleGAN:
         labels: tf.Tensor
     ) -> Dict[str, Any]:
         """Execute one training step."""
+        # Cast inputs to float32
+        real_color = tf.cast(real_color, tf.float32)
+        real_sar = tf.cast(real_sar, tf.float32)
+        labels = tf.cast(labels, tf.float32)
+        
         with tf.GradientTape(persistent=True) as tape:
             # Generator outputs
             # Generator outputs
@@ -876,6 +884,8 @@ class CycleGAN:
         gradients = tape.gradient(pred, interpolated)
         slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1, 2, 3]))
         return tf.reduce_mean(tf.square(slopes - 1.0))
+    
+    
 
 class Trainer:
     def __init__(
@@ -1342,7 +1352,7 @@ def main():
         'epochs': 100,       # Reduced epochs with better scheduling
         'dataset_dir': './Dataset',
         'output_dir': './output',
-        'learning_rate': 2e-4,
+        'learning_rate': 2e-5,
         'lambda_cyc': 5.0,
         'lambda_cls': 0.3,
         'early_stopping_patience': 7,
