@@ -1,5 +1,7 @@
 Dataset/
+logs/
 output/
+__pycache__/
 *.log
 *.png
 hp_tuning/
