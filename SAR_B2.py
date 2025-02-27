@@ -877,7 +877,8 @@ class Trainer:
         val_ds: tf.data.Dataset,
         output_dir: str,
         epochs: int = 100,
-        early_stopping_patience: int = 5
+        early_stopping_patience: int = 5,
+        resume_from: str = None  # Add parameter to specify checkpoint to resume from
     ):
         self.model = model
         self.train_ds = train_ds
@@ -885,6 +886,7 @@ class Trainer:
         self.output_dir = output_dir
         self.epochs = epochs
         self.early_stopping_patience = early_stopping_patience
+        self.start_epoch = 0  # Track starting epoch for resuming
         
         self.val_gen_loss_metric = tf.keras.metrics.Mean()
         self.val_disc_loss_metric = tf.keras.metrics.Mean()
@@ -896,152 +898,164 @@ class Trainer:
         self.patience_counter = 0
         
         os.makedirs(output_dir, exist_ok=True)
+
+        if resume_from:
+            self.load_checkpoint(resume_from)
+            logger.info(f"Resuming training from epoch {self.start_epoch}")
     
     def train(self):
-     """Execute training loop with validation and early stopping."""
-     best_cycle_loss = float('inf')
-     patience_counter = 0
-    
-    # Track best metrics
-     best_metrics = {
-        'epoch': 0,
-        'gen_loss': float('inf'),
-        'disc_loss': float('inf'),
-        'cycle_loss': float('inf'),
-        'cls_loss': float('inf'),
-        'psnr_color': 0,
-        'psnr_sar': 0,
-        'ssim_color': 0,
-        'ssim_sar': 0
-    }
-    
-    # Track final metrics for averaging
-     final_metrics = {
-        'gen_loss': [],
-        'disc_loss': [],
-        'cycle_loss': [],
-        'cls_loss': [],
-        'psnr_color': [],
-        'psnr_sar': [],
-        'ssim_color': [],
-        'ssim_sar': []
-    }
-    
-     for epoch in range(self.epochs):
-        start_time = time.time()
-        
-        # Training
-        for (real_color, real_sar), labels in self.train_ds:
-            metrics = self.model.train_step(real_color, real_sar, labels)
-            self.metrics_logger.update_train(metrics)
-        
-        self.val_gen_loss_metric.reset_states()
-        self.val_disc_loss_metric.reset_states()
-        self.val_cycle_loss_metric.reset_states()
-        self.val_cls_loss_metric.reset_states()
-
-        # Validation
-        val_metrics = self._validate()
-        self.metrics_logger.update_val(val_metrics)
-        
-        # Update final metrics
-        for key in final_metrics:
-            if key in val_metrics:
-                final_metrics[key].append(val_metrics[key])
+        """Execute training loop with validation and early stopping."""
+        best_cycle_loss = float('inf')
+        patience_counter = 0
+        last_epoch = self.start_epoch - 1  # Track the last completed epoch
         
         # Track best metrics
-       
-        if val_metrics['cycle_loss'] < best_cycle_loss:
-            best_cycle_loss = val_metrics['cycle_loss']
-            self.patience_counter = 0
-            self._save_checkpoint(epoch, is_best=True)
-        else:
-            self.patience_counter += 1
+        best_metrics = {
+            'epoch': 0,
+            'gen_loss': float('inf'),
+            'disc_loss': float('inf'),
+            'cycle_loss': float('inf'),
+            'cls_loss': float('inf'),
+            'psnr_color': 0,
+            'psnr_sar': 0,
+            'ssim_color': 0,
+            'ssim_sar': 0
+        }
         
-        # Rest of the existing training loop code...
-        self.metrics_logger.log_epoch(epoch)
+        # Track final metrics for averaging
+        final_metrics = {
+            'gen_loss': [],
+            'disc_loss': [],
+            'cycle_loss': [],
+            'cls_loss': [],
+            'psnr_color': [],
+            'psnr_sar': [],
+            'ssim_color': [],
+            'ssim_sar': []
+        }
+        
+        # Check if we've already completed all epochs
+        if self.start_epoch >= self.epochs:
+            logger.info(f"Training already completed ({self.start_epoch} >= {self.epochs} epochs)")
+            return
             
-            # Visualize results
-        if (epoch + 1) % 5 == 0:
-                sample_images = next(iter(self.val_ds))
-                (real_color, real_sar), _ = sample_images
-                metrics = self.model.validation_step(real_color, real_sar, _)
-                if 'generated_images' in metrics:
-                 fake_color, fake_sar, cycled_color, cycled_sar = (
-                    metrics['generated_images']
-                )
-                 self.visualizer.save_images(
-                    epoch,
-                    [
-                        real_color[0],
-                        fake_sar[0],
-                        cycled_color[0],
-                        real_sar[0],
-                        fake_color[0],
-                        cycled_sar[0]
-                    ],
-                    [
-                        "Real Color",
-                        "Fake SAR",
-                        "Cycled Color",
-                        "Real SAR",
-                        "Fake Color",
-                        "Cycled SAR"
-                    ]
-                )
+        for epoch in range(self.start_epoch, self.epochs):
+            start_time = time.time()
+            last_epoch = epoch  # Update last completed epoch
             
-            # Save checkpoints
-        if (epoch + 1) % 10 == 0:
-                self._save_checkpoint(epoch)
+            # Training
+            for (real_color, real_sar), labels in self.train_ds:
+                metrics = self.model.train_step(real_color, real_sar, labels)
+                self.metrics_logger.update_train(metrics)
             
-            # Early stopping
+            self.val_gen_loss_metric.reset_states()
+            self.val_disc_loss_metric.reset_states()
+            self.val_cycle_loss_metric.reset_states()
+            self.val_cls_loss_metric.reset_states()
+
+            # Validation
+            val_metrics = self._validate()
+            self.metrics_logger.update_val(val_metrics)
             
+            # Update final metrics
+            for key in final_metrics:
+                if key in val_metrics:
+                    final_metrics[key].append(val_metrics[key])
             
-        if self.patience_counter >= self.early_stopping_patience:
-                logger.info(
-                    f"Early stopping triggered after {epoch + 1} epochs"
-                )
-                break
+            # Track best metrics
+           
+            if val_metrics['cycle_loss'] < best_cycle_loss:
+                best_cycle_loss = val_metrics['cycle_loss']
+                self.patience_counter = 0
+                self._save_checkpoint(epoch, is_best=True)
+            else:
+                self.patience_counter += 1
             
-     logger.info(
-                f"Epoch {epoch + 1}/{self.epochs} completed in "
+            # Rest of the existing training loop code...
+            self.metrics_logger.log_epoch(epoch)
+                
+                # Visualize results
+            if (epoch + 1) % 5 == 0:
+                    sample_images = next(iter(self.val_ds))
+                    (real_color, real_sar), _ = sample_images
+                    metrics = self.model.validation_step(real_color, real_sar, _)
+                    if 'generated_images' in metrics:
+                     fake_color, fake_sar, cycled_color, cycled_sar = (
+                        metrics['generated_images']
+                    )
+                     self.visualizer.save_images(
+                        epoch,
+                        [
+                            real_color[0],
+                            fake_sar[0],
+                            cycled_color[0],
+                            real_sar[0],
+                            fake_color[0],
+                            cycled_sar[0]
+                        ],
+                        [
+                            "Real Color",
+                            "Fake SAR",
+                            "Cycled Color",
+                            "Real SAR",
+                            "Fake Color",
+                            "Cycled SAR"
+                        ]
+                    )
+                
+                # Save checkpoints
+            if (epoch + 1) % 10 == 0:
+                    self._save_checkpoint(epoch)
+                
+                # Early stopping
+                
+                
+            if self.patience_counter >= self.early_stopping_patience:
+                    logger.info(
+                        f"Early stopping triggered after {epoch + 1} epochs"
+                    )
+                    break
+                
+        if last_epoch >= 0:  # Only log if at least one epoch was completed
+            logger.info(
+                f"Epoch {last_epoch + 1}/{self.epochs} completed in "
                 f"{time.time() - start_time:.2f}s"
             )
-    
-     logger.info("\n" + "="*50)
-     logger.info("TRAINING COMPLETED - FINAL METRICS REPORT")
-     logger.info("="*50)
-    
-    # Average metrics over last N epochs (e.g., last 5)
-     n_final_epochs = min(5, len(next(iter(final_metrics.values()))))
-     avg_final_metrics = {
-        key: np.mean(values[-n_final_epochs:]) 
-        for key, values in final_metrics.items()
-    }
-    
-     logger.info("\nBest Model Metrics (Epoch {}):".format(best_metrics['epoch']))
-     logger.info("-"*30)
-     for key, value in best_metrics.items():
-        if key != 'epoch':
+        
+        logger.info("\n" + "="*50)
+        logger.info("TRAINING COMPLETED - FINAL METRICS REPORT")
+        logger.info("="*50)
+        
+        # Average metrics over last N epochs (e.g., last 5)
+        n_final_epochs = min(5, len(next(iter(final_metrics.values()))))
+        avg_final_metrics = {
+            key: np.mean(values[-n_final_epochs:]) 
+            for key, values in final_metrics.items()
+        }
+        
+        logger.info("\nBest Model Metrics (Epoch {}):".format(best_metrics['epoch']))
+        logger.info("-"*30)
+        for key, value in best_metrics.items():
+            if key != 'epoch':
+                logger.info(f"{key}: {value:.4f}")
+        
+        logger.info(f"\nFinal Average Metrics (Last {n_final_epochs} epochs):")
+        logger.info("-"*30)
+        for key, value in avg_final_metrics.items():
             logger.info(f"{key}: {value:.4f}")
-    
-     logger.info(f"\nFinal Average Metrics (Last {n_final_epochs} epochs):")
-     logger.info("-"*30)
-     for key, value in avg_final_metrics.items():
-        logger.info(f"{key}: {value:.4f}")
-    
-     logger.info("="*50)
-    
-    # Save final metrics to JSON
-     final_metrics_path = os.path.join(self.output_dir, 'final_metrics.json')
-     metrics_to_save = {
-        'best_metrics': {k: float(v) for k, v in best_metrics.items()},
-        'final_average_metrics': {k: float(v) for k, v in avg_final_metrics.items()}
-    }
-     with open(final_metrics_path, 'w') as f:
-        json.dump(metrics_to_save, f, indent=4)
-    
-     logger.info(f"\nFinal metrics saved to: {final_metrics_path}")
+        
+        logger.info("="*50)
+        
+        # Save final metrics to JSON
+        final_metrics_path = os.path.join(self.output_dir, 'final_metrics.json')
+        metrics_to_save = {
+            'best_metrics': {k: float(v) for k, v in best_metrics.items()},
+            'final_average_metrics': {k: float(v) for k, v in avg_final_metrics.items()}
+        }
+        with open(final_metrics_path, 'w') as f:
+            json.dump(metrics_to_save, f, indent=4)
+        
+        logger.info(f"\nFinal metrics saved to: {final_metrics_path}")
 
     @tf.function
     def _validation_step(self, real_color, real_sar, labels):
@@ -1124,16 +1138,19 @@ class Trainer:
         if not os.path.exists(checkpoint_dir):
             raise ValueError(f"Checkpoint directory {checkpoint_dir} does not exist")
             
-        # Load model
-        self.model = CycleGAN.load(
-            checkpoint_dir,
-            self.model.G1.input_shape[1],  # image_size
-            self.model.D1.output_shape[1]   # num_classes
-        )
-
+        # Load configuration first
+        with open(os.path.join(checkpoint_dir, 'config.json'), 'r') as f:
+            config = json.load(f)
+            
         # Load training state
         with open(os.path.join(checkpoint_dir, 'training_state.json'), 'r') as f:
             training_state = json.load(f)
+        
+        # Load model weights after initializing model
+        self.model.G1.load_weights(os.path.join(checkpoint_dir, 'generator1.h5'))
+        self.model.G2.load_weights(os.path.join(checkpoint_dir, 'generator2.h5'))
+        self.model.D1.load_weights(os.path.join(checkpoint_dir, 'discriminator1.h5'))
+        self.model.D2.load_weights(os.path.join(checkpoint_dir, 'discriminator2.h5'))
             
         self.start_epoch = training_state['epoch'] + 1
         self.val_gen_loss_metric.reset_states()
@@ -1148,6 +1165,7 @@ def main():
         'image_size': 128,  # Reduced from 256
         'batch_size': 8,     # Reduced batch size for stability
         'epochs': 50,       # Reduced epochs with better scheduling
+        'epochs': 20,       # Reduced epochs with better scheduling
         'dataset_dir': './Dataset',
         'output_dir': './output',
         'learning_rate': 2e-4,
@@ -1155,7 +1173,8 @@ def main():
         'lambda_cls': 0.5,
         'early_stopping_patience': 10,
         'validation_split': 0.2,
-        'cache_dataset': True  # Enable dataset caching for faster training
+        'cache_dataset': True,  # Enable dataset caching for faster training
+        'resume_from': './output/checkpoint_epoch_10'  # Specify checkpoint to resume from, or None
     }
     
     # Save configuration
@@ -1186,6 +1205,7 @@ def main():
     )
     train_ds, val_ds = data_loader.load_data()
     
+    # Initialize model first with a dummy input to build shapes
     model = CycleGAN(
         config['image_size'],
         data_loader.num_classes,
@@ -1193,15 +1213,14 @@ def main():
         config['lambda_cls'],
         config['learning_rate']
     )
-    total_params = np.sum([
-        np.prod(v.get_shape().as_list()) 
-        for v in model.G1.trainable_variables + 
-                 model.G2.trainable_variables +
-                 model.D1.trainable_variables + 
-                 model.D2.trainable_variables
-    ])
     
-    logger.info(f"Total trainable parameters: {total_params:,}")
+    # Build model shapes with dummy input
+    dummy_input = tf.zeros((1, config['image_size'], config['image_size'], 3))
+    _ = model.G1(dummy_input)
+    _ = model.G2(dummy_input)
+    _ = model.D1(dummy_input)
+    _ = model.D2(dummy_input)
+    
     model.compile()
     
     trainer = Trainer(
@@ -1210,7 +1229,8 @@ def main():
         val_ds,
         config['output_dir'],
         config['epochs'],
-        config['early_stopping_patience']
+        config['early_stopping_patience'],
+        config['resume_from']
     )
     
     # Start training
@@ -1218,3 +1238,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
