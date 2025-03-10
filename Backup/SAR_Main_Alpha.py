@@ -42,7 +42,6 @@ from keras.applications.inception_v3 import InceptionV3
 from scipy import linalg
 import json
 from scipy.linalg import sqrtm
-import tensorflow_probability as tfp
 
 
 
@@ -61,11 +60,10 @@ CHECKPOINT_DIR = os.path.join(MODEL_SAVE_DIR, 'checkpoints')
 HISTORY_DIR = os.path.join(MODEL_SAVE_DIR, 'history')
 HEAVY_METRICS_INTERVAL = 200  # Calculate heavy metrics every 200 steps
 
-# Update InstanceNormalization class to handle serialization
 class InstanceNormalization(layers.Layer):
     """Native implementation of Instance Normalization"""
-    def __init__(self, epsilon=1e-5, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, epsilon=1e-5):
+        super().__init__()
         self.epsilon = epsilon
 
     def build(self, input_shape):
@@ -76,13 +74,6 @@ class InstanceNormalization(layers.Layer):
         mean, variance = tf.nn.moments(inputs, axes=[1, 2], keepdims=True)
         normalized = (inputs - mean) / tf.sqrt(variance + self.epsilon)
         return self.scale * normalized + self.offset
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'epsilon': self.epsilon,
-        })
-        return config
 
 # Initialize VGG model for perceptual loss
 def create_feature_extractor():
@@ -247,11 +238,10 @@ def create_dataset():
 
 class OptimizedColorTransformation(layers.Layer):
     """Memory-efficient color space transformation"""
-    def __init__(self, **kwargs):
-        super(OptimizedColorTransformation, self).__init__(**kwargs)
+    def __init__(self):
+        super(OptimizedColorTransformation, self).__init__()
         self.conv1 = layers.Conv2D(32, 1, activation='relu')
         self.conv2 = layers.Conv2D(3, 1)
-        self._input_shape_tracker = None
        
     @tf.function
     def rgb_to_lab_efficient(self, rgb):
@@ -264,138 +254,50 @@ class OptimizedColorTransformation(layers.Layer):
     def call(self, x):
         return self.rgb_to_lab_efficient(x)
    
-    def get_config(self):
-        config = super().get_config()
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {"input_shape": self._input_shape_tracker}
-        return {}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
-   
 class LightweightBoundaryDetection(layers.Layer):
     """Efficient boundary detection using depthwise separable convolutions"""
-    def __init__(self, out_filters, **kwargs):
-        super(LightweightBoundaryDetection, self).__init__(**kwargs)
+    def __init__(self, out_filters):
+        super(LightweightBoundaryDetection, self).__init__()
         self.out_filters = out_filters
         self.instance_norm = InstanceNormalization()
-        self._input_shape_tracker = None
        
     def build(self, input_shape):
         input_channels = input_shape[-1]
         self.depthwise = layers.DepthwiseConv2D(3, padding='same',
                                                depth_multiplier=self.out_filters//input_channels)
         self.pointwise = layers.Conv2D(self.out_filters, 1)
-        self._input_shape_tracker = input_shape
        
     def call(self, x):
         x = self.instance_norm(x)
         x = self.depthwise(x)
         return self.pointwise(x)
    
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "out_filters": self.out_filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "out_filters": self.out_filters
-            }
-        return {"out_filters": self.out_filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
-   
 class EfficientSkipConnection(layers.Layer):
     """Memory-efficient skip connections using 1x1 convolutions"""
-    def __init__(self, filters, **kwargs):
-        super(EfficientSkipConnection, self).__init__(**kwargs)
-        self.filters = filters
+    def __init__(self, filters):
+        super(EfficientSkipConnection, self).__init__()
         self.reduction = layers.Conv2D(filters//4, 1)
         self.process = layers.DepthwiseConv2D(3, padding='same')
-        self._input_shape_tracker = None
        
     def call(self, x, skip_features):
         processed = [self.reduction(feat) for feat in skip_features]
         processed = [self.process(feat) for feat in processed]
         return tf.concat([x] + processed, axis=-1)
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "filters": self.filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "filters": self.filters
-            }
-        return {"filters": self.filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
 
 class TerrainGuidedAttention(layers.Layer):
     """Attention mechanism that explicitly considers terrain information"""
-    def __init__(self, channels, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, channels):
+        super().__init__()
         self.channels = channels
-        self.query = None  # Initialize in build method
-        self.key = None    # Initialize in build method
-        self.value = None  # Initialize in build method
+        self.query = layers.Conv2D(channels // 8, 1)
+        self.key = layers.Conv2D(channels // 8, 1)
+        self.value = layers.Conv2D(channels, 1)
         self.gamma = self.add_weight(name="gamma", shape=(1,), initializer="zeros")
-        self.terrain_project = None  # Initialize in build method
-        self._input_shape_tracker = None
+        self.terrain_project = layers.Dense(channels)  # Initialize in __init__
 
     def build(self, input_shape):
-        if not isinstance(input_shape, (list, tuple)):
+        if not isinstance(input_shape, list):
             raise ValueError("TerrainGuidedAttention expects a list of input shapes")
-           
-        x_shape, terrain_shape = input_shape
-       
-        # Ensure we're using the correct number of channels based on input
-        actual_channels = x_shape[-1]
-       
-        # Create layers with proper dimensions
-        self.query = layers.Conv2D(actual_channels // 8, 1)
-        self.key = layers.Conv2D(actual_channels // 8, 1)
-        self.value = layers.Conv2D(actual_channels, 1)
-        self.terrain_project = layers.Dense(actual_channels)
-       
-        # Build all child layers explicitly
-        self.query.build(x_shape)
-        self.key.build(x_shape)
-        self.value.build(x_shape)
-        self.terrain_project.build(terrain_shape)
-       
-        self._input_shape_tracker = input_shape
-        self.built = True
         super().build(input_shape)
        
     def call(self, inputs):
@@ -435,33 +337,11 @@ class TerrainGuidedAttention(layers.Layer):
 
     def compute_output_shape(self, input_shape):
         return input_shape[0]
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "channels": self.channels,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "channels": self.channels
-            }
-        return {"channels": self.channels}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
+
 
 class TerrainAdaptiveNormalization(layers.Layer):
-    def __init__(self, channels, **kwargs):
-        super(TerrainAdaptiveNormalization, self).__init__(**kwargs)
+    def __init__(self, channels):
+        super(TerrainAdaptiveNormalization, self).__init__()
         self.channels = channels
         self.norm = layers.BatchNormalization(axis=-1)
         self.terrain_scale = layers.Dense(channels)
@@ -469,12 +349,12 @@ class TerrainAdaptiveNormalization(layers.Layer):
         self.color_norm = layers.LayerNormalization(axis=-1)
         self.color_scale = layers.Dense(channels)
         self.color_bias = layers.Dense(channels)
-        self._input_shape_tracker = None
-       
+
     def build(self, input_shape):
-        if not isinstance(input_shape, (list, tuple)):
+        if not isinstance(input_shape, list):
             raise ValueError("TerrainAdaptiveNormalization expects a list of input shapes")
         x_shape, terrain_shape = input_shape
+       
         # Just build the layers without shape validation
         self.norm.build(x_shape)
         self.terrain_scale.build(terrain_shape)
@@ -482,7 +362,7 @@ class TerrainAdaptiveNormalization(layers.Layer):
         self.color_norm.build(x_shape)
         self.color_scale.build(terrain_shape)
         self.color_bias.build(terrain_shape)
-        self._input_shape_tracker = input_shape
+       
         super(TerrainAdaptiveNormalization, self).build(input_shape)
 
     def call(self, inputs, training=None):
@@ -516,40 +396,15 @@ class TerrainAdaptiveNormalization(layers.Layer):
 
         return (terrain_norm + color_norm) / 2
    
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "channels": self.channels,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "channels": self.channels
-            }
-        return {"channels": self.channels}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
-   
 class TerrainAwareResBlock(layers.Layer):
     """Residual block with terrain-specific processing"""
-    def __init__(self, filters, **kwargs):
-        super(TerrainAwareResBlock, self).__init__(**kwargs)
-        self.filters = filters
+    def __init__(self, filters):
+        super(TerrainAwareResBlock, self).__init__()
         self.conv1 = layers.Conv2D(filters, 3, padding='same')
         self.conv2 = layers.Conv2D(filters, 3, padding='same')
         self.norm1 = TerrainAdaptiveNormalization(filters)
         self.norm2 = TerrainAdaptiveNormalization(filters)
         self.attention = TerrainGuidedAttention(filters)
-        self._input_shape_tracker = None
        
     def call(self, x, terrain_features):
         residual = x
@@ -563,44 +418,20 @@ class TerrainAwareResBlock(layers.Layer):
         x = self.attention([x, terrain_features])
        
         return tf.nn.relu(x + residual)
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "filters": self.filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "filters": self.filters
-            }
-        return {"filters": self.filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
 
 class ColorRefinementBlock(layers.Layer):
     """Enhanced color refinement with spatial and semantic context"""
-    def __init__(self, filters, **kwargs):
-        super(ColorRefinementBlock, self).__init__(**kwargs)
+    def __init__(self, filters):
+        super(ColorRefinementBlock, self).__init__()
         self.filters = filters
         self.context_conv = layers.Conv2D(filters, 3, padding='same')
         self.terrain_norm = TerrainAdaptiveNormalization(filters)
         self.attention = TerrainGuidedAttention(filters)
         self.refine_conv = layers.Conv2D(filters, 1)
         self.activation = layers.Activation('relu')
-        self._input_shape_tracker = None
        
     def build(self, input_shape):
-        if not isinstance(input_shape, (list, tuple)):
+        if not isinstance(input_shape, list):
             raise ValueError("ColorRefinementBlock expects a list of input shapes")
            
         x_shape, terrain_shape = input_shape
@@ -614,7 +445,6 @@ class ColorRefinementBlock(layers.Layer):
         self.terrain_norm.build([conv_output_shape, terrain_shape])
         self.attention.build([conv_output_shape, terrain_shape])
         self.refine_conv.build(conv_output_shape)
-        self._input_shape_tracker = input_shape
        
         super(ColorRefinementBlock, self).build(input_shape)
        
@@ -633,76 +463,29 @@ class ColorRefinementBlock(layers.Layer):
     def compute_output_shape(self, input_shape):
         x_shape, _ = input_shape
         return (x_shape[0], x_shape[1], x_shape[2], self.filters)
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "filters": self.filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "filters": self.filters
-            }
-        return {"filters": self.filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
 
 class MemoryEfficientResBlock(layers.Layer):
-    def __init__(self, filters, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, filters):
+        super().__init__()
         self.filters = filters
-        self.conv1 = None  # Initialize in build to ensure proper input shape
-        self.conv2 = None  # Initialize in build to ensure proper input shape
+        self.conv1 = layers.SeparableConv2D(filters, 3, padding='same')
+        self.conv2 = layers.SeparableConv2D(filters, 3, padding='same')
         self.norm1 = InstanceNormalization()
         self.norm2 = InstanceNormalization()
-        self.attention = None  # Initialize in build
-        self.activation = layers.Activation('silu')
-        self.input_proj = None
-        self._input_shape_tracker = None
+        self.attention = TerrainGuidedAttention(filters)  # Match filters
+        self.activation = layers.Activation('silu')  # Using Keras Activation
        
     def build(self, input_shape):
-        if not isinstance(input_shape, (list, tuple)):
+        if not isinstance(input_shape, list):
             raise ValueError("MemoryEfficientResBlock expects a list of input shapes")
-       
         x_shape, terrain_shape = input_shape
-        self._input_shape_tracker = [x_shape, terrain_shape]
        
-        # Determine actual input channels
-        input_channels = x_shape[-1]
-       
-        # Create and build input_proj if needed
-        if input_channels != self.filters:
+        # Ensure input is projected to correct number of filters if needed
+        if x_shape[-1] != self.filters:
             self.input_proj = layers.Conv2D(self.filters, 1, padding='same')
-            self.input_proj.build(x_shape)
-            # Update x_shape for subsequent layers
-            x_shape = x_shape.as_list()
-            x_shape[-1] = self.filters
-            x_shape = tf.TensorShape(x_shape)
-       
-        # Now create conv layers with correct input shape
-        self.conv1 = layers.SeparableConv2D(self.filters, 3, padding='same')
-        self.conv2 = layers.SeparableConv2D(self.filters, 3, padding='same')
-        self.attention = TerrainGuidedAttention(self.filters)
-       
-        # Explicitly build all child layers with proper shapes
-        self.conv1.build(x_shape)
-        self.conv2.build(x_shape)
-        self.norm1.build(x_shape)
-        self.norm2.build(x_shape)
-        self.attention.build([x_shape, terrain_shape])
-        self.activation.build(x_shape)
+        else:
+            self.input_proj = None
            
-        self.built = True
         super().build(input_shape)
        
     def call(self, inputs):
@@ -712,10 +495,10 @@ class MemoryEfficientResBlock(layers.Layer):
         x, terrain = inputs
        
         # Project input if needed
-        residual = x
         if self.input_proj is not None:
             x = self.input_proj(x)
-            residual = x  # Use projected tensor as residual connection
+           
+        residual = x
        
         x = self.conv1(x)
         x = self.norm1(x)
@@ -729,41 +512,11 @@ class MemoryEfficientResBlock(layers.Layer):
 
     def compute_output_shape(self, input_shape):
         return (input_shape[0][0], input_shape[0][1], input_shape[0][2], self.filters)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "filters": self.filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "filters": self.filters
-            }
-        return {"filters": self.filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
    
 class SiLUActivation(layers.Layer):
     """Wrapper for SiLU activation"""
     def call(self, x):
         return tf.nn.silu(x)
-   
-    def get_config(self):
-        return super().get_config()
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
 
 
 def build_terrain_aware_generator():
@@ -786,10 +539,9 @@ def build_terrain_aware_generator():
         x = InstanceNormalization()(x)
         x = layers.Activation('silu')(x)
 
-    # Middle blocks at 32x32 resolution - use consistent filter size to prevent shape mismatch
-    for i in range(9):
-        # Use the same filter size as the last downsampling layer to maintain consistency
-        x = MemoryEfficientResBlock(256)([x, terrain_input])
+    # Middle blocks at 32x32 resolution
+    for _ in range(9):
+        x = MemoryEfficientResBlock(512)([x, terrain_input])
 
     # Upsampling back to 128x128
     for skip, filters in zip(reversed(skip_connections), reversed(filter_sizes)):
@@ -807,54 +559,21 @@ class TileLayer(layers.Layer):
     def call(self, inputs):
         terrain_spatial, batch_size = inputs
         return tf.tile(terrain_spatial, [batch_size, 1, 1, 1])
-   
-    def get_config(self):
-        return super().get_config()
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
 
 class TerrainSpatialLayer(layers.Layer):
     """Layer to handle terrain spatial features with explicit tensor shapes"""
-    def __init__(self, height, width, **kwargs):
-        super(TerrainSpatialLayer, self).__init__(**kwargs)
+    def __init__(self, height, width):
+        super(TerrainSpatialLayer, self).__init__()
         self.height = height
         self.width = width
         self.dense1 = layers.Dense(512, activation='relu')
         self.dense2 = layers.Dense(height * width)
         self.reshape = layers.Reshape((height, width, 1))
-        self._input_shape_tracker = None
        
     def call(self, terrain_input):
         x = self.dense1(terrain_input)
         x = self.dense2(x)
         return self.reshape(x)
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "height": self.height,
-            "width": self.width,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "height": self.height,
-                "width": self.width
-            }
-        return {"height": self.height, "width": self.width}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
 
 def build_terrain_aware_discriminator():
     """Discriminator with proper tensor shape handling"""
@@ -905,8 +624,8 @@ class DebugGenerator(tf.keras.Model):
 
 class DynamicWeightedLoss(layers.Layer):
     """Adaptive loss weighting based on training dynamics"""
-    def __init__(self, num_losses, **kwargs):
-        super(DynamicWeightedLoss, self).__init__(**kwargs)
+    def __init__(self, num_losses):
+        super(DynamicWeightedLoss, self).__init__()
         self.loss_weights = self.add_weight(
             "loss_weights",
             shape=[num_losses],
@@ -918,17 +637,6 @@ class DynamicWeightedLoss(layers.Layer):
         weights = tf.nn.softmax(self.loss_weights)
         return tf.reduce_sum([w * l for w, l in zip(weights, losses)])
    
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "num_losses": self.num_losses,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
 
 class AdaptiveLRSchedule:
     def __init__(self, initial_lr=2e-4, min_lr=1e-6, patience=5, factor=0.5, metric_window=10):
@@ -936,7 +644,7 @@ class AdaptiveLRSchedule:
         self.min_lr = min_lr
         self.patience = self.patience
         self.factor = self.factor
-        self.metric_window = metric_window
+        self.metric_window = self.metric_window
         self.best_metric = float('inf')
         self.patience_counter = 0
         self.metrics_history = []
@@ -1355,26 +1063,6 @@ def train_step(sar_images, color_images, terrain_labels, generator, discriminato
    
     return metrics, generated_images_f32
 
-# Update history initialization to remove style_loss
-def get_initial_history():
-    return {
-        'gen_loss': [], 'disc_loss': [],
-        'psnr': [], 'ssim': [],
-        'cycle_loss': [], 'l2_loss': [],
-        'feature_matching_loss': [],
-        'lpips': [],
-        'l1_loss': [],
-        'perceptual_loss': [],
-        'val_gen_loss': [], 'val_disc_loss': [],
-        'val_psnr': [], 'val_ssim': [],
-        'val_l1_loss': [], 'val_l2_loss': [],
-        'val_perceptual_loss': [], 'val_cycle_loss': [],
-        'val_feature_matching_loss': [],
-        'val_lpips': [],
-        'fid': [], 'val_fid': []
-    }
-
-# Update the train function to use new history initialization
 def train(train_dataset, val_dataset, epochs, resume_training=True):
     """Modified training function with validation set integration and comprehensive metrics"""
    
@@ -1395,21 +1083,49 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
             if loaded_gen is not None:
                 generator = loaded_gen
                 discriminator = loaded_disc
-                start_epoch = loaded_history.get('epoch', 0) + 1
-                history = loaded_history.get('history', get_initial_history())
+                start_epoch = loaded_history['epoch'] + 1
+                history = loaded_history['history']
                 print(f"Resuming training from epoch {start_epoch}")
             else:
                 generator = build_terrain_aware_generator()
                 discriminator = build_terrain_aware_discriminator()
                 start_epoch = 0
-                history = get_initial_history()
+                history = {
+                    'gen_loss': [], 'disc_loss': [],
+                    'psnr': [], 'ssim': [],
+                    'cycle_loss': [], 'l2_loss': [],
+                    'feature_matching_loss': [],
+                    'lpips': [],
+                    'l1_loss': [], 'style_loss': [],
+                    'perceptual_loss': [],
+                    'val_gen_loss': [], 'val_disc_loss': [],
+                    'val_psnr': [], 'val_ssim': [],
+                    'val_l1_loss': [], 'val_l2_loss': [],
+                    'val_perceptual_loss': [], 'val_cycle_loss': [],
+                    'val_style_loss': [], 'val_feature_matching_loss': [],
+                    'val_lpips': []
+                }
         else:
             generator = build_terrain_aware_generator()
             discriminator = build_terrain_aware_discriminator()
             start_epoch = 0
-            history = get_initial_history()
+            history = {
+                'gen_loss': [], 'disc_loss': [],
+                'psnr': [], 'ssim': [],
+                'cycle_loss': [], 'l2_loss': [],
+                'feature_matching_loss': [],
+                'lpips': [],
+                'l1_loss': [], 'style_loss': [],
+                'perceptual_loss': [],
+                'val_gen_loss': [], 'val_disc_loss': [],
+                'val_psnr': [], 'val_ssim': [],
+                'val_l1_loss': [], 'val_l2_loss': [],
+                'val_perceptual_loss': [], 'val_cycle_loss': [],
+                'val_style_loss': [], 'val_feature_matching_loss': [],
+                'val_lpips': []
+            }
        
-        # Initialize optimizers with gradient clipping using the standard optimizer
+        # Initialize optimizers with gradient clipping
         generator_optimizer = tf.keras.optimizers.Adam(
             1e-4,  # Lower learning rate for stability
             beta_1=0.5,
@@ -1545,6 +1261,7 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
         # Now use the distributed_train_step in your training loop
         for epoch in range(start_epoch, start_epoch + epochs):
             start = time.time()
+            print(f"\nEpoch {epoch + 1}/{start_epoch + epochs}")
            
             # Training phase
             nan_count = 0
@@ -1559,13 +1276,13 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
                 'cycle_loss': 0.0, 'l2_loss': 0.0,
                 'feature_matching_loss': 0.0,
                 'lpips': 0.0, 'l1_loss': 0.0,
-                'perceptual_loss': 0.0,
+                'style_loss': 0.0, 'perceptual_loss': 0.0,
                 'val_gen_loss': 0.0, 'val_disc_loss': 0.0,
                 'val_psnr': 0.0, 'val_ssim': 0.0,
                 'val_l1_loss': 0.0, 'val_l2_loss': 0.0,
                 'val_perceptual_loss': 0.0, 'val_cycle_loss': 0.0,
-                'val_feature_matching_loss': 0.0,
-                'val_lpips': 0.0, 'fid': 0.0, 'val_fid': 0.0
+                'val_style_loss': 0.0, 'val_feature_matching_loss': 0.0,
+                'val_lpips': 0.0
             }
            
             # Training loop
@@ -1623,11 +1340,9 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
                                     if key in epoch_metrics:
                                         epoch_metrics[key] += value
                                
-                                # Print detailed metrics including FID
+                                # Print detailed metrics
                                 metrics_str = ", ".join([f"{k}: {v:.4f}" for k, v in detailed_metrics.items()])
-                                # Print FID prominently
-                                fid_value = detailed_metrics.get('fid', 0.0)
-                                #print(f"\nStep {step} detailed metrics - FID: {fid_value:.4f} | {metrics_str}")
+                                print(f"\nStep {step} detailed metrics - {metrics_str}")
                                
                             except Exception as metrics_err:
                                 print(f"\nError calculating detailed metrics: {metrics_err}")
@@ -1635,15 +1350,7 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
                         if step % 10 == 0:
                             avg_gen = total_gen_loss / (step + 1)
                             avg_disc = total_disc_loss / (step + 1)
-                           
-                            # Add FID to regular status updates if available
-                            fid_str = ""
-                            if 'fid' in epoch_metrics and epoch_metrics['fid'] > 0:
-                                avg_fid = epoch_metrics['fid'] / max(1, steps_per_epoch // 50)
-                                fid_str = f", FID: {avg_fid:.4f}"
-                               
-                            #print(f"\rStep {step} - Gen Loss: {avg_gen:.4f}, Disc Loss: {avg_disc:.4f}{fid_str}", end='')
-                           
+                            print(f"\rStep {step} - Gen Loss: {avg_gen:.4f}, Disc Loss: {avg_disc:.4f}", end='')
                     except tf.errors.ResourceExhaustedError:
                         print("\nResource exhausted, skipping batch")
                         continue
@@ -1667,20 +1374,38 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
                         if epoch_metrics[key] > 0:
                             history[key].append(float(epoch_metrics[key] / max(steps_per_epoch // 50, 1)))
            
+                # Print training metrics in an organized, tabular format
+                print("\n┌─" + "─"*93 + "┐")
+                print("│ " + "TRAINING METRICS:".ljust(92) + " │")
+                print("├─" + "─"*93 + "┤")
                
                 # Print loss metrics
                 gen_loss = get_latest_metric(history, 'gen_loss')
                 disc_loss = get_latest_metric(history, 'disc_loss')
+                print(f"│ Loss Metrics:    gen_loss: {gen_loss:.4f} | disc_loss: {disc_loss:.4f}".ljust(94) + "│")
+               
+                # Print image quality metrics
                 psnr = get_latest_metric(history, 'psnr')
                 ssim = get_latest_metric(history, 'ssim')
+                print(f"│ Quality Metrics: psnr: {psnr:.4f} | ssim: {ssim:.4f}".ljust(94) + "│")
+               
+                # Print content loss metrics
                 l1_loss = get_latest_metric(history, 'l1_loss')
                 l2_loss = get_latest_metric(history, 'l2_loss')
                 perceptual = get_latest_metric(history, 'perceptual_loss')
+                print(f"│ Content Metrics: l1_loss: {l1_loss:.4f} | l2_loss: {l2_loss:.4f} | perceptual: {perceptual:.4f}".ljust(94) + "│")
+               
+                # Print style metrics
+                style_loss = get_latest_metric(history, 'style_loss')
                 feature_matching = get_latest_metric(history, 'feature_matching_loss')
+                print(f"│ Style Metrics:   style_loss: {style_loss:.4f} | feature_matching: {feature_matching:.4f}".ljust(94) + "│")
+               
+                # Print advanced metrics
                 cycle_loss = get_latest_metric(history, 'cycle_loss')
                 lpips = get_latest_metric(history, 'lpips')
-                fid = get_latest_metric(history, 'fid', 0.0)  # Get FID with default 0.0
-                print(f"│ Epoch {epoch + 1}/{start_epoch + epochs} (Training) : gen_loss: {gen_loss:.4f} | disc_loss: {disc_loss:.4f} | cycle_loss: {cycle_loss:.4f} | psnr: {psnr:.4f} | ssim: {ssim:.4f} | l1_loss: {l1_loss:.4f} | l2_loss: {l2_loss:.4f} | feature_matching: {feature_matching:.4f} | lpips: {lpips:.4f} | FID: {fid:.4f}")
+                print(f"│ Advanced Metrics: cycle_loss: {cycle_loss:.4f} | lpips: {lpips:.4f}".ljust(94) + "│")
+               
+                print("└─" + "─"*93 + "┘")
            
             # Validation phase
             print("\nRunning validation...")
@@ -1695,13 +1420,10 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
                 'style_loss': [],
                 'feature_matching_loss': [],
                 'cycle_loss': [],
-                'lpips': [], 'fid': []
+                'lpips': []
             }
            
             # Process validation batch by batch to collect detailed metrics
-            all_val_generated_images = []
-            all_val_real_images = []
-           
             for val_batch in val_dataset:
                 sar_batch, color_batch, terrain_batch = val_batch
                
@@ -1727,9 +1449,6 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
                     sar_batch, color_batch, generated_images, cycle_reconstructed, terrain_batch
                 )
                
-                # Print per-batch FID for validation
-               
-               
                 # Store all validation metrics
                 val_metrics['gen_loss'].append(gen_total_loss.numpy())
                 val_metrics['disc_loss'].append(disc_loss.numpy())
@@ -1742,22 +1461,6 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
                 for key, value in detailed_metrics.items():
                     if key in val_metrics and key not in ['psnr', 'ssim', 'l1_loss', 'perceptual_loss']:
                         val_metrics[key].append(value)
-           
-            # Calculate FID on larger combined validation set for more accurate measurement
-            try:
-                if len(all_val_generated_images) > 0:
-                    combined_generated = tf.concat(all_val_generated_images, axis=0)
-                    combined_real = tf.concat(all_val_real_images, axis=0)
-                   
-                    if combined_generated.shape[0] >= 16:  # Enough samples for meaningful FID
-                        combined_fid = calculate_fid_score(combined_real, combined_generated)
-                        print(f"\nValidation FID on combined set ({combined_generated.shape[0]} images): {combined_fid.numpy():.4f}")
-                       
-                        # Add to metrics
-                        if 'fid' in avg_val_metrics:
-                            avg_val_metrics['fid'] = combined_fid.numpy()
-            except Exception as combined_fid_err:
-                print(f"Error calculating combined validation FID: {combined_fid_err}")
            
             # Calculate average validation metrics
             avg_val_metrics = {k: np.mean(v) for k, v in val_metrics.items() if len(v) > 0}
@@ -1773,19 +1476,35 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
                 val_key = f'val_{key}'
                 epoch_metrics[val_key] = float(value)
            
+            # Print validation metrics in an organized, tabular format
+            print("\n┌─" + "─"*93 + "┐")
+            print("│ " + "VALIDATION METRICS:".ljust(92) + " │")
+            print("├─" + "─"*93 + "┤")
            
             # Print validation metrics using safe dictionary access
             gen_loss = avg_val_metrics.get('gen_loss', 0.0)
             disc_loss = avg_val_metrics.get('disc_loss', 0.0)
+            print(f"│ Loss Metrics:    gen_loss: {gen_loss:.4f} | disc_loss: {disc_loss:.4f}".ljust(94) + "│")
+           
             psnr = avg_val_metrics.get('psnr', 0.0)
             ssim = avg_val_metrics.get('ssim', 0.0)
+            print(f"│ Quality Metrics: psnr: {psnr:.4f} | ssim: {ssim:.4f}".ljust(94) + "│")
+           
             l1_loss = avg_val_metrics.get('l1_loss', 0.0)
             l2_loss = avg_val_metrics.get('l2_loss', 0.0)
+            perceptual = avg_val_metrics.get('perceptual_loss', 0.0)
+            print(f"│ Content Metrics: l1_loss: {l1_loss:.4f} | l2_loss: {l2_loss:.4f} | perceptual: {perceptual:.4f}".ljust(94) + "│")
+           
+            style_loss = avg_val_metrics.get('style_loss', 0.0)
+            feature_matching = avg_val_metrics.get('feature_matching_loss', 0.0)
+            print(f"│ Style Metrics:   style_loss: {style_loss:.4f} | feature_matching: {feature_matching:.4f}".ljust(94) + "│")
+           
             cycle_loss = avg_val_metrics.get('cycle_loss', 0.0)
             lpips = avg_val_metrics.get('lpips', 0.0)
-            fid = avg_val_metrics.get('fid', 0.0)
-            feature_matching = avg_val_metrics.get('feature_matching_loss', 0.0)
-            print(f"│ Epoch {epoch + 1}/{start_epoch + epochs} (Validation) : gen_loss: {gen_loss:.4f} | disc_loss: {disc_loss:.4f} | cycle_loss: {cycle_loss:.4f} | psnr: {psnr:.4f} | ssim: {ssim:.4f} | l1_loss: {l1_loss:.4f} | l2_loss: {l2_loss:.4f} | feature_matching: {feature_matching:.4f} | lpips: {lpips:.4f} | FID: {fid:.4f}")          
+            print(f"│ Advanced Metrics: cycle_loss: {cycle_loss:.4f} | lpips: {lpips:.4f}".ljust(94) + "│")
+           
+            print("└─" + "─"*93 + "┘")
+           
             print(f"\nTime taken for epoch {epoch + 1}: {time.time() - start:.2f} sec")
            
             # Generate visualizations every 5 epochs
@@ -1803,11 +1522,14 @@ def train(train_dataset, val_dataset, epochs, resume_training=True):
             # Save comprehensive model checkpoint every epoch
             try:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_data = {
-                    'epoch': epoch,
-                    'history': history
-                }
-                save_model_checkpoint(generator, discriminator, save_data, timestamp)
+                save_model_checkpoint(
+                    generator,
+                    discriminator,
+                    history,
+                    epoch,
+                    epoch_metrics,
+                    timestamp
+                )
                 print(f"Saved checkpoint for epoch {epoch+1}")
             except Exception as save_error:
                 print(f"Error saving checkpoint: {save_error}")
@@ -1874,279 +1596,194 @@ def calculate_detailed_metrics(sar_images, color_images, generated_images, cycle
         metrics['ssim'] = tf.image.ssim(color_images, generated_images, max_val=2.0).numpy().mean()
         metrics['cycle_loss'] = tf.reduce_mean(tf.abs(sar_images - cycle_reconstructed)).numpy()
         metrics['perceptual_loss'] = compute_perceptual_loss(color_images, generated_images).numpy()
-       
+        
         # Calculate LPIPS using the feature extractor
         # LPIPS measures perceptual similarity using deep features
         try:
             # Preprocess images for feature extraction
             real_images_processed = efficientnet.preprocess_input((color_images + 1) * 127.5)
             generated_images_processed = efficientnet.preprocess_input((generated_images + 1) * 127.5)
-           
+            
             # Extract features
             real_features = feature_extractor(real_images_processed)
             gen_features = feature_extractor(generated_images_processed)
-           
+            
             # Calculate normalized distance between feature representations
             lpips_value = 0.0
             for rf, gf in zip(real_features, gen_features):
                 # Normalize features
                 rf_norm = tf.nn.l2_normalize(rf, axis=-1)
                 gf_norm = tf.nn.l2_normalize(gf, axis=-1)
-               
+                
                 # Compute distance
                 lpips_value += tf.reduce_mean(tf.square(rf_norm - gf_norm))
-           
+            
             metrics['lpips'] = lpips_value.numpy() / len(real_features)
         except Exception as e:
             print(f"Error calculating LPIPS: {e}")
             metrics['lpips'] = 0.0
-           
+            
         # Calculate feature matching loss
         # This measures style similarity using discriminator features
         try:
             # We need the discriminator to extract features
             # Since we can't directly access it here, we'll use a simplified approach
             # using our feature extractor as a substitute
-           
+            
             # Extract mid-level features (these represent style information)
             style_features_real = real_features[1]  # Using middle layer features
             style_features_gen = gen_features[1]
-           
+            
             # Calculate mean and variance for each feature map (Gram matrix simplified)
             real_mean = tf.reduce_mean(style_features_real, axis=[1, 2], keepdims=True)
             gen_mean = tf.reduce_mean(style_features_gen, axis=[1, 2], keepdims=True)
-           
+            
             real_std = tf.math.reduce_std(style_features_real, axis=[1, 2], keepdims=True)
             gen_std = tf.math.reduce_std(style_features_gen, axis=[1, 2], keepdims=True)
-           
+            
             # Feature matching loss combines differences in mean and standard deviation
             mean_loss = tf.reduce_mean(tf.abs(real_mean - gen_mean))
             std_loss = tf.reduce_mean(tf.abs(real_std - gen_std))
-           
+            
             metrics['feature_matching_loss'] = (mean_loss + std_loss).numpy()
         except Exception as e:
             print(f"Error calculating feature matching loss: {e}")
             metrics['feature_matching_loss'] = 0.0
-       
-        # Calculate FID score
-        # This requires a sufficient batch size to be meaningful,
-        # so we'll only calculate it if we have enough images
-        try:
-            if color_images.shape[0] >= 8:  # Minimum batch size for meaningful FID
-                fid_score = calculate_fid_score(color_images, generated_images)
-                metrics['fid'] = fid_score.numpy()
-            else:
-                # For small batches, approximate FID using feature statistics
-                # from our existing feature extractor
-                real_feats_flat = tf.concat([tf.reshape(f, [tf.shape(f)[0], -1])
-                                           for f in real_features], axis=1)
-                gen_feats_flat = tf.concat([tf.reshape(f, [tf.shape(f)[0], -1])
-                                          for f in gen_features], axis=1)
-               
-                # Calculate mean and covariance
-                mu_real = tf.reduce_mean(real_feats_flat, axis=0)
-                mu_gen = tf.reduce_mean(gen_feats_flat, axis=0)
-               
-                # Use mean difference as simplified FID for small batches
-                metrics['fid'] = tf.reduce_mean(tf.square(mu_real - mu_gen)).numpy()
-        except Exception as e:
-            print(f"Error calculating FID score: {e}")
-            metrics['fid'] = 0.0
-           
+            
     except Exception as e:
         print(f"Error in metrics: {e}")
         metrics = {k: 0.0 for k in [
-            'l1_loss', 'l2_loss', 'psnr', 'ssim', 'cycle_loss',
-            'perceptual_loss', 'lpips', 'feature_matching_loss', 'fid'
+            'l1_loss', 'l2_loss', 'psnr', 'ssim', 'cycle_loss', 
+            'perceptual_loss', 'lpips', 'feature_matching_loss'
         ]}
-   
+    
     return metrics
 
-# Fix save_model_checkpoint function
-def save_model_checkpoint(generator, discriminator, save_data, timestamp):
-    """Improved model saving with consistent directory structure"""
-    # Create a fixed checkpoint directory to maintain consistency between runs
+def save_model_checkpoint(generator, discriminator, history, epoch, metrics, timestamp):
+    """Save comprehensive model checkpoint with all necessary data for resuming training"""
+    # Create checkpoint directory structure for Kaggle
     checkpoint_dir = '/kaggle/working/checkpoints'
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    model_dir = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}_{timestamp}')
+    os.makedirs(model_dir, exist_ok=True)
    
-    # Create unique subdirectory based on timestamp and epoch
-    epoch = save_data['epoch']
-    checkpoint_subdir = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}_{timestamp}')
-    os.makedirs(checkpoint_subdir, exist_ok=True)
-   
+    # Save model architectures and weights
     try:
-        # Save model weights with explicit paths
-        gen_weights_path = os.path.join(checkpoint_subdir, 'generator.weights.h5')
-        disc_weights_path = os.path.join(checkpoint_subdir, 'discriminator.weights.h5')
+        # Save complete models using .keras format
+        generator.save(os.path.join(model_dir, 'generator_model.keras'))
+        discriminator.save(os.path.join(model_dir, 'discriminator_model.keras'))
        
-        generator.save_weights(gen_weights_path)
-        discriminator.save_weights(disc_weights_path)
-       
-        # Verify weights were actually saved
-        if not os.path.exists(gen_weights_path) or not os.path.exists(disc_weights_path):
-            raise FileNotFoundError("Model weights were not saved properly")
-       
-        # Save model config separately for reliable loading
-        with open(os.path.join(checkpoint_subdir, 'generator_config.json'), 'w') as f:
-            json.dump(generator.get_config(), f)
-           
-        with open(os.path.join(checkpoint_subdir, 'discriminator_config.json'), 'w') as f:
-            json.dump(discriminator.get_config(), f)
-       
-        # Save optimizer states
-        if hasattr(generator, 'optimizer') and generator.optimizer:
-            gen_opt_state = extract_optimizer_state(generator.optimizer)
-            with open(os.path.join(checkpoint_subdir, 'generator_optimizer.json'), 'w') as f:
-                json.dump(gen_opt_state, f)
-       
-        if hasattr(discriminator, 'optimizer') and discriminator.optimizer:
-            disc_opt_state = extract_optimizer_state(discriminator.optimizer)
-            with open(os.path.join(checkpoint_subdir, 'discriminator_optimizer.json'), 'w') as f:
-                json.dump(disc_opt_state, f)
-       
-        # Save history separately
-        history_path = os.path.join(checkpoint_subdir, 'training_history.json')
-        with open(history_path, 'w') as f:
-            json.dump(save_data, f)
-       
-        # Update latest checkpoint pointer to point to the subdirectory
-        with open(os.path.join(checkpoint_dir, 'latest_checkpoint.txt'), 'w') as f:
-            f.write(checkpoint_subdir)
-       
-        print(f"Models successfully saved to {checkpoint_subdir}")
-        print(f"  - Generator weights: {os.path.getsize(gen_weights_path)/1024/1024:.2f} MB")
-        print(f"  - Discriminator weights: {os.path.getsize(disc_weights_path)/1024/1024:.2f} MB")
-       
-    except Exception as e:
-        print(f"ERROR: Failed to save checkpoint: {e}")
-        import traceback
-        traceback.print_exc()
-
-def load_latest_models():
-    """Enhanced model loading with comprehensive error handling"""
-    checkpoint_dir = '/kaggle/working/checkpoints'
-    latest_file = os.path.join(checkpoint_dir, 'latest_checkpoint.txt')
+        # Also save weights separately as backup
+        generator.save_weights(os.path.join(model_dir, 'generator_weights.h5'))
+        discriminator.save_weights(os.path.join(model_dir, 'discriminator_weights.h5'))
+    except Exception as model_save_err:
+        print(f"Error saving model architecture: {model_save_err}")
+        # Fall back to saving only weights
+        try:
+            generator.save_weights(os.path.join(model_dir, 'generator_weights.h5'))
+            discriminator.save_weights(os.path.join(model_dir, 'discriminator_weights.h5'))
+        except Exception as weights_save_err:
+            print(f"Error saving model weights: {weights_save_err}")
    
-    if not os.path.exists(checkpoint_dir):
-        print("No checkpoint directory found. Will start fresh.")
-        return None, None, {}
-   
-    if not os.path.exists(latest_file):
-        print("No checkpoint tracking file found. Will start fresh.")
-        return None, None, {}
-   
-    # Define custom objects for model loading
-    custom_objects = {
-        "InstanceNormalization": InstanceNormalization,
-        "OptimizedColorTransformation": OptimizedColorTransformation,
-        "LightweightBoundaryDetection": LightweightBoundaryDetection,
-        "EfficientSkipConnection": EfficientSkipConnection,
-        "TerrainGuidedAttention": TerrainGuidedAttention,
-        "TerrainAdaptiveNormalization": TerrainAdaptiveNormalization,
-        "TerrainAwareResBlock": TerrainAwareResBlock,
-        "ColorRefinementBlock": ColorRefinementBlock,
-        "MemoryEfficientResBlock": MemoryEfficientResBlock,
-        "SiLUActivation": SiLUActivation,
-        "TileLayer": TileLayer,
-        "TerrainSpatialLayer": TerrainSpatialLayer
+    # Save training state
+    training_state = {
+        'epoch': epoch,
+        'history': history,
+        'timestamp': timestamp,
+        'latest_metrics': metrics
     }
    
-    try:
-        # Read the checkpoint directory path
-        with open(latest_file, 'r') as f:
-            checkpoint_path = f.read().strip()
-       
-        if not os.path.exists(checkpoint_path):
-            print(f"Checkpoint directory {checkpoint_path} does not exist. Will start fresh.")
-            return None, None, {}
-       
-        # Check for weights files with clear logging
-        gen_weights_path = os.path.join(checkpoint_path, 'generator.weights.h5')
-        disc_weights_path = os.path.join(checkpoint_path, 'discriminator.weights.h5')
-       
-        if not os.path.exists(gen_weights_path):
-            print(f"ERROR: Generator weights file not found at {gen_weights_path}")
-            return None, None, {}
-           
-        if not os.path.exists(disc_weights_path):
-            print(f"ERROR: Discriminator weights file not found at {disc_weights_path}")
-            return None, None, {}
-       
-        print(f"Found model weights files:")
-        print(f"  - Generator weights: {os.path.getsize(gen_weights_path)/1024/1024:.2f} MB")
-        print(f"  - Discriminator weights: {os.path.getsize(disc_weights_path)/1024/1024:.2f} MB")
-       
-        # Always recreate models from scratch for consistency
-        generator = build_terrain_aware_generator()
-        discriminator = build_terrain_aware_discriminator()
-       
-        # Force model to build by passing dummy inputs
-        dummy_sar = tf.zeros((1, IMG_HEIGHT, IMG_WIDTH, 3), dtype=tf.float32)
-        dummy_terrain = tf.zeros((1, len(TERRAIN_TYPES)), dtype=tf.float32)
-        dummy_color = tf.zeros((1, IMG_HEIGHT, IMG_WIDTH, 3), dtype=tf.float32)
-       
-        # Build the models with dummy forward passes
-        _ = generator([dummy_sar, dummy_terrain], training=False)
-        _ = discriminator([dummy_sar, dummy_color, dummy_terrain], training=False)
-       
-        # Then load weights with explicit try-except
-        try:
-            generator.load_weights(gen_weights_path)
-            discriminator.load_weights(disc_weights_path)
-            print("Successfully loaded model weights")
-        except Exception as weight_error:
-            print(f"ERROR loading weights: {weight_error}")
-            import traceback
-            traceback.print_exc()
-            return None, None, {}
-       
-        # Create fresh optimizers
-        gen_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5, clipnorm=1.0)
-        disc_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5, clipnorm=1.0)
-       
-        # Compile models with the fresh optimizers
-        generator.compile(optimizer=gen_optimizer)
-        discriminator.compile(optimizer=disc_optimizer)
-       
-        # Load optimizer states if they exist
-        gen_opt_path = os.path.join(checkpoint_path, 'generator_optimizer.json')
-        disc_opt_path = os.path.join(checkpoint_path, 'discriminator_optimizer.json')
-       
-        if os.path.exists(gen_opt_path):
-            try:
-                with open(gen_opt_path, 'r') as f:
-                    gen_opt_state = json.load(f)
-                    generator.optimizer = restore_optimizer_state(generator.optimizer, gen_opt_state)
-                    print("Restored generator optimizer state")
-            except Exception as opt_error:
-                print(f"Warning: Could not restore generator optimizer: {opt_error}")
-       
-        if os.path.exists(disc_opt_path):
-            try:
-                with open(disc_opt_path, 'r') as f:
-                    disc_opt_state = json.load(f)
-                    discriminator.optimizer = restore_optimizer_state(discriminator.optimizer, disc_opt_state)
-                    print("Restored discriminator optimizer state")
-            except Exception as opt_error:
-                print(f"Warning: Could not restore discriminator optimizer: {opt_error}")
-       
-        # Load training history
-        history_path = os.path.join(checkpoint_path, 'training_history.json')
-        if os.path.exists(history_path):
-            with open(history_path, 'r') as f:
-                save_data = json.load(f)
-            print(f"Successfully loaded checkpoint from {os.path.basename(checkpoint_path)}")
-            print(f"Resuming from epoch {save_data.get('epoch', 0) + 1}")
-            return generator, discriminator, save_data
-        else:
-            print("No training history found, using default history")
-            return generator, discriminator, {'epoch': 0, 'history': get_initial_history()}
+    with open(os.path.join(model_dir, 'training_state.json'), 'w') as f:
+        json.dump(training_state, f, indent=2)
    
+    # Save latest checkpoint reference
+    latest_checkpoint = {
+        'latest_checkpoint': model_dir,
+        'epoch': epoch,
+        'timestamp': timestamp
+    }
+   
+    with open(os.path.join(checkpoint_dir, 'latest_checkpoint.json'), 'w') as f:
+        json.dump(latest_checkpoint, f, indent=2)
+   
+    # For Kaggle: Copy latest checkpoint info to output directory to preserve across sessions
+    os.makedirs('/kaggle/working/output', exist_ok=True)
+    with open('/kaggle/working/output/latest_checkpoint_info.json', 'w') as f:
+        json.dump(latest_checkpoint, f, indent=2)
+   
+    return model_dir
+
+def load_latest_models():
+    """Enhanced function to load the most recent saved models and history with Kaggle support"""
+    # First try loading from Kaggle working directory
+    checkpoint_dir = '/kaggle/working/checkpoints'
+    latest_file = os.path.join(checkpoint_dir, 'latest_checkpoint.json')
+   
+    # If not found, check if we have info in the output directory from previous sessions
+    if not os.path.exists(latest_file):
+        output_info = '/kaggle/working/output/latest_checkpoint_info.json'
+        if os.path.exists(output_info):
+            with open(output_info, 'r') as f:
+                checkpoint_info = json.load(f)
+           
+            # Update latest_checkpoint info - might be in a different path in new session
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            with open(latest_file, 'w') as f:
+                json.dump(checkpoint_info, f, indent=2)
+   
+    try:
+        if os.path.exists(latest_file):
+            with open(latest_file, 'r') as f:
+                latest_info = json.load(f)
+           
+            model_dir = latest_info['latest_checkpoint']
+           
+            # Check if model directory exists - might have changed in new Kaggle session
+            if not os.path.exists(model_dir):
+                print(f"Model directory {model_dir} not found. Starting from scratch.")
+                return None, None, None
+           
+            # Custom objects for model loading
+            custom_objects = {
+                'InstanceNormalization': InstanceNormalization,
+                'TerrainGuidedAttention': TerrainGuidedAttention,
+                'TerrainAdaptiveNormalization': TerrainAdaptiveNormalization,
+                'MemoryEfficientResBlock': MemoryEfficientResBlock,
+                'ColorRefinementBlock': ColorRefinementBlock
+            }
+           
+            # Try loading complete model first using .keras format
+            try:
+                generator = tf.keras.models.load_model(
+                    os.path.join(model_dir, 'generator_model.keras'),
+                    custom_objects=custom_objects
+                )
+                discriminator = tf.keras.models.load_model(
+                    os.path.join(model_dir, 'discriminator_model.keras'),
+                    custom_objects=custom_objects
+                )
+            except Exception as model_load_err:
+                print(f"Error loading complete models: {model_load_err}")
+                print("Trying to load from weights...")
+                # Fall back to loading from weights
+                generator = build_terrain_aware_generator()
+                discriminator = build_terrain_aware_discriminator()
+               
+                generator.load_weights(os.path.join(model_dir, 'generator_weights.h5'))
+                discriminator.load_weights(os.path.join(model_dir, 'discriminator_weights.h5'))
+           
+            # Load training state
+            with open(os.path.join(model_dir, 'training_state.json'), 'r') as f:
+                training_state = json.load(f)
+           
+            print(f"\nLoaded models and history from checkpoint at epoch {training_state['epoch']+1}")
+            return generator, discriminator, training_state
+        else:
+            print("No checkpoint found, starting from scratch")
+            return None, None, None
+           
     except Exception as e:
-        print(f"Error loading models: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, {}
+        print(f"Error loading models: {str(e)}")
+        return None, None, None
 
 def plot_training_history(history, save_path='/kaggle/working/training_curves'):
     """Enhanced plot function with more comparisons between train and validation metrics"""
@@ -2196,7 +1833,7 @@ def plot_training_history(history, save_path='/kaggle/working/training_curves'):
        
         if not valid_metrics:
             continue
-       
+           
         plt.figure(figsize=(12, 7))
         for metric in valid_metrics:
             plt.plot(history[metric], label=metric)
@@ -2226,169 +1863,7 @@ def get_latest_metric(history_dict, metric_name, default=0.0):
     except (IndexError, TypeError, AttributeError):
         return default
 
-# Add this function to calculate FID score
-def calculate_fid_score(real_images, generated_images):
-    """
-    Calculate Fréchet Inception Distance between real and generated images
-    """
-    # Ensure inputs are in the right format for InceptionV3
-    real_images = tf.image.resize(real_images, [299, 299])
-    real_images = tf.clip_by_value((real_images + 1.0) / 2.0, 0.0, 1.0) * 255.0
-   
-    generated_images = tf.image.resize(generated_images, [299, 299])
-    generated_images = tf.clip_by_value((generated_images + 1.0) / 2.0, 0.0, 1.0) * 255.0
-   
-    # Create inception model for feature extraction if it doesn't already exist
-    inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(299, 299, 3))
-   
-    # Extract features
-    real_features = inception_model(real_images, training=False)
-    gen_features = inception_model(generated_images, training=False)
-   
-    # Calculate mean and covariance statistics
-    mu_real = tf.reduce_mean(real_features, axis=0)
-    sigma_real = tfp.stats.covariance(real_features)
-   
-    mu_gen = tf.reduce_mean(gen_features, axis=0)
-    sigma_gen = tfp.stats.covariance(gen_features)
-   
-    # Calculate squared difference between means
-    mean_diff_squared = tf.reduce_sum(tf.square(mu_real - mu_gen))
-   
-    # Calculate square root of product of covariances
-    # Note: To avoid numerical issues, we use the scipy implementation
-    covmean = sqrtm(tf.matmul(sigma_real, sigma_gen))
-   
-    # Check if result contains complex numbers
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-   
-    # Calculate FID score
-    trace_covmean = tf.linalg.trace(covmean)
-    trace_real = tf.linalg.trace(sigma_real)
-    trace_gen = tf.linalg.trace(sigma_gen)
-   
-    fid = mean_diff_squared + trace_real + trace_gen - 2 * trace_covmean
-   
-    return fid
-
-# Add these utility functions for handling optimizer states
-def extract_optimizer_state(optimizer):
-    """Extract optimizer variables into a serializable dictionary"""
-    optimizer_vars = {}
-   
-    # Use optimizer.get_weights() if available (safer than iterating variables)
-    try:
-        # Extract iteration directly from optimizer's private internal state
-        # (This is version-specific but works in TF 2.17.1)
-        optimizer_vars['iteration'] = optimizer.iterations.numpy().item()
-       
-        # Collect all weights as flat arrays for consistent serialization
-        weight_values = optimizer.get_weights()
-        weight_names = [w.name for w in optimizer.weights]
-        optimizer_vars['weights'] = [(name, val.tolist()) for name, val in zip(weight_names, weight_values)]
-       
-        # Store hyperparameters that might be needed for reconstruction
-        optimizer_vars['learning_rate'] = float(optimizer.lr.numpy()) if hasattr(optimizer, 'lr') else 0.001
-        optimizer_vars['beta_1'] = float(optimizer.beta_1.numpy()) if hasattr(optimizer, 'beta_1') else 0.9
-        optimizer_vars['beta_2'] = float(optimizer.beta_2.numpy()) if hasattr(optimizer, 'beta_2') else 0.999
-        optimizer_vars['epsilon'] = float(optimizer.epsilon) if hasattr(optimizer, 'epsilon') else 1e-7
-       
-        return optimizer_vars
-    except Exception as e:
-        print(f"Error extracting optimizer state: {e}")
-        return {"error": str(e)}
-
-def restore_optimizer_state(optimizer, optimizer_state):
-    """Restore optimizer state from dictionary"""
-    if "error" in optimizer_state:
-        print(f"Cannot restore optimizer state: {optimizer_state['error']}")
-        return optimizer
-   
-    try:
-        # Set iteration
-        if 'iteration' in optimizer_state:
-            optimizer.iterations.assign(optimizer_state['iteration'])
-       
-        # Re-create weights if the structure matches
-        if 'weights' in optimizer_state:
-            # Convert back to numpy arrays from lists
-            weights_data = [(name, np.array(val)) for name, val in optimizer_state['weights']]
-           
-            # Make sure the weight count matches what's expected
-            if len(weights_data) == len(optimizer.weights):
-                # Sort both lists by name to ensure correct assignment
-                opt_weights = sorted(optimizer.weights, key=lambda x: x.name)
-                saved_weights = sorted(weights_data, key=lambda x: x[0])
-               
-                # Assign values to weights
-                for (_, saved_val), opt_weight in zip(saved_weights, opt_weights):
-                    # Ensure shapes match
-                    if saved_val.shape == opt_weight.shape:
-                        opt_weight.assign(saved_val)
-                    else:
-                        print(f"Shape mismatch: {opt_weight.name} - {opt_weight.shape} vs {saved_val.shape}")
-            else:
-                print(f"Weight count mismatch: {len(weights_data)} saved vs {len(optimizer.weights)} current")
-       
-        return optimizer
-    except Exception as e:
-        print(f"Error restoring optimizer state: {e}")
-        return optimizer
-
-# Add this utility function to reset optimizer state if needed (fixing NaN issues)
-def reset_optimizer_state(optimizer):
-    """Reset optimizer state to handle NaN values or other issues"""
-    try:
-        # Zero out momentum and other state variables
-        for var in optimizer.weights:
-            var.assign(tf.zeros_like(var))
-       
-        # Set iteration back to 0
-        optimizer.iterations.assign(0)
-       
-        return optimizer
-    except Exception as e:
-        print(f"Error resetting optimizer: {e}")
-        return optimizer
-
-# Modify the handle_training_issues function to use reset_optimizer_state
-def handle_training_issues(generator_optimizer, discriminator_optimizer):
-    """Check for and fix optimizer issues"""
-    try:
-        nan_detected = False
-       
-        # Check generator optimizer for NaN
-        for var in generator_optimizer.weights:
-            if tf.reduce_any(tf.math.is_nan(var)):
-                nan_detected = True
-                break
-       
-        if nan_detected:
-            print("Detected NaN in generator optimizer, resetting...")
-            generator_optimizer = reset_optimizer_state(generator_optimizer)
-       
-        # Reset nan_detected flag
-        nan_detected = False
-       
-        # Check discriminator optimizer for NaN
-        for var in discriminator_optimizer.weights:
-            if tf.reduce_any(tf.math.is_nan(var)):
-                nan_detected = True
-                break
-       
-        if nan_detected:
-            print("Detected NaN in discriminator optimizer, resetting...")
-            discriminator_optimizer = reset_optimizer_state(discriminator_optimizer)
-       
-        return generator_optimizer, discriminator_optimizer
-    except Exception as e:
-        print(f"Error handling training issues: {e}")
-        return generator_optimizer, discriminator_optimizer
-
-#main function
-   
-if __name__  == '__main__':
+if __name__ == '__main__':
     with strategy.scope():
         # Get train, validation and test datasets
         train_dataset, val_dataset, test_dataset = create_dataset()
