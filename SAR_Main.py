@@ -39,32 +39,22 @@ from datetime import datetime
 import time
 from keras.applications import efficientnet
 from keras.applications.inception_v3 import InceptionV3
-from scipy import linalg
 import json
 from scipy.linalg import sqrtm
 import tensorflow_probability as tfp
 
-
-
 # Constants
 BUFFER_SIZE = 400
-BATCH_SIZE = 1  # Fixed at 1
-IMG_WIDTH = 256  # Changed from 256 to 128
-IMG_HEIGHT = 256  # Changed from 256 to 128
-LAMBDA = 10
+BATCH_SIZE = 1  # Changed back to 1 for stability
+IMG_WIDTH = 256
+IMG_HEIGHT = 256
+LAMBDA = 10 # Reduced from 11 to 10 for better balance
 TERRAIN_TYPES = ['urban', 'grassland', 'agri', 'barrenland']
-STYLE_WEIGHT = 1.0
-CYCLE_WEIGHT = 10.0
-COLOR_WEIGHT = 5.0
-MODEL_SAVE_DIR = '/kaggle/working/saved_models'
-CHECKPOINT_DIR = os.path.join(MODEL_SAVE_DIR, 'checkpoints')
-HISTORY_DIR = os.path.join(MODEL_SAVE_DIR, 'history')
-HEAVY_METRICS_INTERVAL = 200  # Calculate heavy metrics every 200 steps
 
 # Update InstanceNormalization class to handle serialization
 class InstanceNormalization(layers.Layer):
     """Native implementation of Instance Normalization"""
-    def __init__(self, epsilon=1e-5, **kwargs):
+    def __init__(self, epsilon=1e-8, **kwargs):
         super().__init__(**kwargs)
         self.epsilon = epsilon
 
@@ -73,9 +63,23 @@ class InstanceNormalization(layers.Layer):
         self.offset = self.add_weight(name='offset', shape=(input_shape[-1],), initializer='zeros')
 
     def call(self, inputs):
+        # Get the input dtype to ensure we return same type
+        input_dtype = inputs.dtype
+        
+        # Calculate mean and variance (moments)
         mean, variance = tf.nn.moments(inputs, axes=[1, 2], keepdims=True)
         normalized = (inputs - mean) / tf.sqrt(variance + self.epsilon)
-        return self.scale * normalized + self.offset
+        
+        # Cast weights to match input dtype for proper broadcasting in mixed precision
+        scale = tf.cast(self.scale, input_dtype)
+        offset = tf.cast(self.offset, input_dtype)
+        
+        # Use the static shape from self.scale for reshaping to avoid shape mismatches
+        num_channels = self.scale.shape[0]
+        scale = tf.reshape(scale, [1, 1, 1, num_channels])
+        offset = tf.reshape(offset, [1, 1, 1, num_channels])
+        
+        return scale * normalized + offset
 
     def get_config(self):
         config = super().get_config()
@@ -83,6 +87,360 @@ class InstanceNormalization(layers.Layer):
             'epsilon': self.epsilon,
         })
         return config
+
+# Define required component classes before they're used
+# Enhanced ChannelAttention module for focusing on important feature dimensions
+class ChannelAttention(layers.Layer):
+    """Efficient channel attention module"""
+    def __init__(self, ratio=16, **kwargs):
+        super().__init__(**kwargs)
+        self.ratio = ratio
+        self.avg_pool = layers.GlobalAveragePooling2D(keepdims=True)
+        self.max_pool = layers.GlobalMaxPooling2D(keepdims=True)
+        self.avg_dense1 = None
+        self.avg_dense2 = None
+        self.max_dense1 = None
+        self.max_dense2 = None
+
+    def build(self, input_shape):
+        channels = input_shape[-1]
+        reduced_channels = max(channels // self.ratio, 8)
+        self.avg_dense1 = layers.Dense(reduced_channels, activation='relu', use_bias=False)
+        self.avg_dense2 = layers.Dense(channels, use_bias=False)
+        self.max_dense1 = layers.Dense(reduced_channels, activation='relu', use_bias=False)
+        self.max_dense2 = layers.Dense(channels, use_bias=False)
+        super().build(input_shape)
+
+    def call(self, inputs):
+        channels = inputs.shape[-1]
+        batch_size = tf.shape(inputs)[0]
+
+        # Pooling
+        avg_pool = tf.reduce_mean(inputs, axis=[1, 2], keepdims=True)
+        max_pool = tf.reduce_max(inputs, axis=[1, 2], keepdims=True)
+
+        avg_pool_2d = tf.reshape(avg_pool, [batch_size, channels])
+        max_pool_2d = tf.reshape(max_pool, [batch_size, channels])
+
+        avg_attention = self.avg_dense2(self.avg_dense1(avg_pool_2d))
+        max_attention = self.max_dense2(self.max_dense1(max_pool_2d))
+
+        attention = tf.nn.sigmoid(avg_attention + max_attention)
+        attention = tf.reshape(attention, [batch_size, 1, 1, channels])
+        attention = tf.cast(attention, inputs.dtype)
+        return inputs * attention
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'ratio': self.ratio
+        })
+        return config
+
+# Spatial Attention module for focusing on important spatial regions
+class SpatialAttention(layers.Layer):
+    """Memory-efficient spatial attention"""
+    def __init__(self, kernel_size=7, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = kernel_size
+        self.conv = layers.Conv2D(1, kernel_size, padding='same', activation='sigmoid')
+        
+    def build(self, input_shape):
+        self.conv.build([input_shape[0], input_shape[1], input_shape[2], 2])
+        self.built = True
+        
+    def call(self, inputs):
+        # Generate channel-wise statistics
+        avg_pool = tf.reduce_mean(inputs, axis=-1, keepdims=True)
+        max_pool = tf.reduce_max(inputs, axis=-1, keepdims=True)
+        
+        # Concatenate pools and apply convolution
+        concat = tf.concat([avg_pool, max_pool], axis=-1)
+        spatial_attention = self.conv(concat)
+        
+        return inputs * spatial_attention
+        
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'kernel_size': self.kernel_size
+        })
+        return config
+
+# Combined attention module (CBAM) with memory optimization
+class CBAM(layers.Layer):
+    """Memory-efficient CBAM implementation"""
+    def __init__(self, filters, **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+        self.channel_attention = None
+        self.spatial_attention = None
+
+    def build(self, input_shape):
+        # Always build ChannelAttention and SpatialAttention with the actual input shape
+        self.channel_attention = ChannelAttention()
+        self.channel_attention.build(input_shape)
+        self.spatial_attention = SpatialAttention()
+        self.spatial_attention.build(input_shape)
+        self.built = True
+
+    def call(self, inputs):
+        x = self.channel_attention(inputs)
+        x = self.spatial_attention(x)
+        return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'filters': self.filters
+        })
+        return config
+
+# Spectral normalization for weight stability
+class SpectralNormalization(layers.Wrapper):
+    """Memory-efficient spectral normalization implementation"""
+    def __init__(self, layer, iterations=1, **kwargs):
+        super().__init__(layer, **kwargs)
+        self.iterations = iterations
+        
+    def build(self, input_shape=None):
+        if not self.layer.built:
+            self.layer.build(input_shape)
+            
+        self.w = self.layer.kernel
+        self.w_shape = self.w.shape.as_list()
+        
+        # Initialize u vector for power iteration
+        # Use correct shape: The vector u should have shape (1, output_channels)
+        self.u = self.add_weight(
+            shape=(1, self.w_shape[-1]), 
+            initializer=tf.initializers.TruncatedNormal(stddev=0.02),
+            trainable=False,
+            name='sn_u'
+        )
+        
+        super().build()
+        
+    def call(self, inputs):
+        self._update_weights()
+        return self.layer(inputs)
+        
+    def _update_weights(self):
+        """Efficient power iteration method with proper dimension handling"""
+        # Reshape kernel to [kernel_height * kernel_width * input_channels, output_channels]
+        # This ensures the matrix multiplication dimensions are compatible
+        w_reshaped = tf.reshape(self.w, [-1, self.w_shape[-1]])
+        
+        # Just one iteration is usually sufficient and saves memory
+        u_hat = tf.identity(self.u)  # [1, output_channels]
+        
+        # Transpose w_reshaped for first multiplication
+        # u_hat [1, output_channels] × w_reshaped^T [output_channels, flattened_kernel_size]
+        v_hat = tf.matmul(u_hat, tf.transpose(w_reshaped))  # Result: [1, flattened_kernel_size]
+        v_hat = tf.nn.l2_normalize(v_hat)  # Normalize to unit vector
+        
+        # Now multiply v_hat [1, flattened_kernel_size] × w_reshaped [flattened_kernel_size, output_channels]
+        u_hat = tf.matmul(v_hat, w_reshaped)  # Result: [1, output_channels]
+        u_hat = tf.nn.l2_normalize(u_hat)  # Normalize to unit vector
+        
+        # Update the stored u vector
+        self.u.assign(u_hat)
+        
+        # Compute the spectral norm: u × W × v^T
+        sigma = tf.squeeze(tf.matmul(tf.matmul(v_hat, w_reshaped), tf.transpose(u_hat)))
+        
+        # Ensure sigma is a scalar
+        sigma = tf.reshape(sigma, [])
+        
+        # Avoid division by zero
+        sigma = tf.maximum(sigma, 1e-12)
+        
+        # Update the layer's kernel
+        self.layer.kernel.assign(self.w / sigma)
+    
+    def compute_output_shape(self, input_shape):
+        return self.layer.compute_output_shape(input_shape)
+        
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'iterations': self.iterations
+        })
+        return config
+
+# Memory-efficient wavelet-inspired processing block
+class WaveletResidualBlock(layers.Layer):
+    """Memory-efficient wavelet-inspired residual block"""
+    def __init__(self, filters, dropout_rate=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+        self.dropout_rate = dropout_rate
+        self.skip_conv = None
+        self.attention = CBAM(filters)
+        self.dropout = layers.Dropout(dropout_rate)
+        self.activation = layers.LeakyReLU(0.2)
+        # Remove group_filters and group layers from __init__
+        # They will be created in build()
+        self.channel_adjust = None  # <-- Add this line
+    
+    def build(self, input_shape):
+        input_channels = input_shape[-1]
+        # Compute group sizes (last group may be larger if not divisible by 4)
+        base_group = input_channels // 4
+        group_sizes = [base_group] * 3 + [input_channels - base_group * 3]
+        self.group_sizes = group_sizes
+
+        # Build group convs and norms with correct shapes
+        self.group_convs1 = []
+        self.group_convs2 = []
+        self.group_norms1 = []
+        self.group_norms2 = []
+        for i, ch in enumerate(group_sizes):
+            conv1 = layers.SeparableConv2D(ch, 3, padding='same')
+            conv2 = layers.SeparableConv2D(ch, 3, padding='same')
+            norm1 = InstanceNormalization()
+            norm2 = InstanceNormalization()
+            # Build with correct group shape
+            group_shape = tf.TensorShape([input_shape[0], input_shape[1], input_shape[2], ch])
+            conv1.build(group_shape)
+            conv2.build(group_shape)
+            norm1.build(group_shape)
+            norm2.build(group_shape)
+            self.group_convs1.append(conv1)
+            self.group_convs2.append(conv2)
+            self.group_norms1.append(norm1)
+            self.group_norms2.append(norm2)
+
+        if input_channels != self.filters:
+            self.skip_conv = layers.Conv2D(self.filters, 1, padding='same')
+            self.skip_conv.build(input_shape)
+        # Always build channel_adjust for possible use in call()
+        # Use input_channels for the last dimension (not None)
+        self.channel_adjust = layers.Conv2D(self.filters, 1, padding='same')
+        self.channel_adjust.build(tf.TensorShape([input_shape[0], input_shape[1], input_shape[2], input_channels]))
+        self.attention.build(tf.TensorShape([input_shape[0], input_shape[1], input_shape[2], self.filters]))
+        self.built = True
+
+    def compute_output_shape(self, input_shape):
+        # Handle case when input_shape is a list or tuple
+        if isinstance(input_shape, list) or isinstance(input_shape, tuple):
+            input_shape = input_shape[0]
+        
+        # Handle case when input_shape is None
+        if input_shape is None:
+            return tf.TensorShape((None, None, None, self.filters))
+        
+        # Get input shape as list for easier manipulation
+        input_list = input_shape.as_list()
+        
+        # Return shape with batch, height, width from input, but channels=filters
+        return tf.TensorShape(input_list[:-1] + [self.filters])
+        
+    def call(self, inputs, training=None):
+        # Check if inputs is a list or a tensor (with better error handling)
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) >= 2:
+                x, terrain = inputs[0], inputs[1]
+            else:
+                x = inputs[0]
+                terrain = None
+                print("Warning: Expected two elements in inputs list but got fewer.")
+        else:
+            # Direct tensor input
+            x = inputs
+            terrain = None
+            
+        # Safety check - ensure x is a tensor
+        if x is None:
+            raise ValueError("Input tensor is None in WaveletResidualBlock.")
+        
+        shortcut = x
+
+        # Ensure shortcut has the correct number of channels
+        if shortcut.shape[-1] != self.filters:
+            # If skip_conv exists, use it; otherwise, create and use a new 1x1 conv
+            if self.skip_conv is not None:
+                shortcut = self.skip_conv(x)
+            else:
+                shortcut = layers.Conv2D(self.filters, 1, padding='same')(x)
+        
+        # Split channels into groups according to group_sizes
+        group_outputs = []
+        start = 0
+        for i, ch in enumerate(self.group_sizes):
+            group = x[:, :, :, start:start+ch]
+            group = self.group_convs1[i](group)
+            group = self.group_norms1[i](group)
+            group = self.activation(group)
+            dilation = i + 1
+            group = self.group_convs2[i](group)
+            if dilation > 1:
+                group = group * (1.0 + 0.1 * i)
+            group = self.group_norms2[i](group)
+            group = self.activation(group)
+            group_outputs.append(group)
+            start += ch
+        
+        # Concatenate the processed groups
+        output = tf.concat(group_outputs, axis=-1)
+        
+        # Make sure output has exactly self.filters channels
+        # This ensures output and shortcut have the same shape
+        if output.shape[-1] != self.filters:
+            output = self.channel_adjust(output)
+        
+        # Apply attention
+        if terrain is not None:
+            output = self.attention([output, terrain])
+        else:
+            output = self.attention(output)
+        
+        # Apply dropout
+        if self.dropout_rate > 0:
+            output = self.dropout(output, training=training)
+        
+        # Add residual connection (shapes now guaranteed to match)
+        output = layers.add([output, shortcut])
+        output = self.activation(output)
+        
+        return output
+        
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'filters': self.filters,
+            'dropout_rate': self.dropout_rate
+        })
+        return config
+
+# Add task-specific metrics function
+def calculate_task_specific_metrics(real_images, generated_images, metrics_dict):
+    """Calculate SAR-specific metrics"""
+    # Convert to float32 for metric calculation
+    real_images = tf.cast(real_images, tf.float32)
+    generated_images = tf.cast(generated_images, tf.float32)
+    
+    # Ensure valid range
+    real_clipped = tf.clip_by_value(real_images, -1.0, 1.0)
+    gen_clipped = tf.clip_by_value(generated_images, -1.0, 1.0)
+    
+    # Color fidelity - measure color histogram similarity
+    real_mean_color = tf.reduce_mean(real_clipped, axis=[1, 2])
+    gen_mean_color = tf.reduce_mean(gen_clipped, axis=[1, 2])
+    color_diff = tf.reduce_mean(tf.abs(real_mean_color - gen_mean_color))
+    metrics_dict['color_fidelity'] = color_diff
+    
+    # Edge consistency - measure edge preservation
+    real_dy, real_dx = tf.image.image_gradients(real_clipped)
+    gen_dy, gen_dx = tf.image.image_gradients(gen_clipped)
+    
+    real_edges = tf.sqrt(tf.square(real_dx) + tf.square(real_dy))
+    gen_edges = tf.sqrt(tf.square(gen_dx) + tf.square(gen_dy))
+    
+    edge_diff = tf.reduce_mean(tf.abs(real_edges - gen_edges))
+    metrics_dict['edge_consistency'] = edge_diff
+    
+    return metrics_dict
 
 # Initialize VGG model for perceptual loss
 def create_feature_extractor():
@@ -245,122 +603,6 @@ def create_dataset():
        
         return train_ds, val_ds, test_ds
 
-class OptimizedColorTransformation(layers.Layer):
-    """Memory-efficient color space transformation"""
-    def __init__(self, **kwargs):
-        super(OptimizedColorTransformation, self).__init__(**kwargs)
-        self.conv1 = layers.Conv2D(32, 1, activation='relu')
-        self.conv2 = layers.Conv2D(3, 1)
-        self._input_shape_tracker = None
-       
-    @tf.function
-    def rgb_to_lab_efficient(self, rgb):
-        # Optimized RGB to LAB conversion
-        rgb = (rgb + 1) * 0.5  # [-1,1] to [0,1]
-        features = self.conv1(rgb)
-        lab_like = self.conv2(features)
-        return lab_like
-       
-    def call(self, x):
-        return self.rgb_to_lab_efficient(x)
-   
-    def get_config(self):
-        config = super().get_config()
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {"input_shape": self._input_shape_tracker}
-        return {}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
-   
-class LightweightBoundaryDetection(layers.Layer):
-    """Efficient boundary detection using depthwise separable convolutions"""
-    def __init__(self, out_filters, **kwargs):
-        super(LightweightBoundaryDetection, self).__init__(**kwargs)
-        self.out_filters = out_filters
-        self.instance_norm = InstanceNormalization()
-        self._input_shape_tracker = None
-       
-    def build(self, input_shape):
-        input_channels = input_shape[-1]
-        self.depthwise = layers.DepthwiseConv2D(3, padding='same',
-                                               depth_multiplier=self.out_filters//input_channels)
-        self.pointwise = layers.Conv2D(self.out_filters, 1)
-        self._input_shape_tracker = input_shape
-       
-    def call(self, x):
-        x = self.instance_norm(x)
-        x = self.depthwise(x)
-        return self.pointwise(x)
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "out_filters": self.out_filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "out_filters": self.out_filters
-            }
-        return {"out_filters": self.out_filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
-   
-class EfficientSkipConnection(layers.Layer):
-    """Memory-efficient skip connections using 1x1 convolutions"""
-    def __init__(self, filters, **kwargs):
-        super(EfficientSkipConnection, self).__init__(**kwargs)
-        self.filters = filters
-        self.reduction = layers.Conv2D(filters//4, 1)
-        self.process = layers.DepthwiseConv2D(3, padding='same')
-        self._input_shape_tracker = None
-       
-    def call(self, x, skip_features):
-        processed = [self.reduction(feat) for feat in skip_features]
-        processed = [self.process(feat) for feat in processed]
-        return tf.concat([x] + processed, axis=-1)
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "filters": self.filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "filters": self.filters
-            }
-        return {"filters": self.filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
-
 class TerrainGuidedAttention(layers.Layer):
     """Attention mechanism that explicitly considers terrain information"""
     def __init__(self, channels, **kwargs):
@@ -483,7 +725,7 @@ class TerrainAdaptiveNormalization(layers.Layer):
         self.color_scale.build(terrain_shape)
         self.color_bias.build(terrain_shape)
         self._input_shape_tracker = input_shape
-        super(TerrainAdaptiveNormalization, self).build(input_shape)
+        super(TerrainAdaptiveNormalization(self, self).build(input_shape))
 
     def call(self, inputs, training=None):
         if not isinstance(inputs, (list, tuple)) or len(inputs) != 2:
@@ -539,123 +781,6 @@ class TerrainAdaptiveNormalization(layers.Layer):
         if not self.built and "input_shape" in config:
             self.build(config["input_shape"])
    
-class TerrainAwareResBlock(layers.Layer):
-    """Residual block with terrain-specific processing"""
-    def __init__(self, filters, **kwargs):
-        super(TerrainAwareResBlock, self).__init__(**kwargs)
-        self.filters = filters
-        self.conv1 = layers.Conv2D(filters, 3, padding='same')
-        self.conv2 = layers.Conv2D(filters, 3, padding='same')
-        self.norm1 = TerrainAdaptiveNormalization(filters)
-        self.norm2 = TerrainAdaptiveNormalization(filters)
-        self.attention = TerrainGuidedAttention(filters)
-        self._input_shape_tracker = None
-       
-    def call(self, x, terrain_features):
-        residual = x
-       
-        x = self.conv1(x)
-        x = self.norm1([x, terrain_features])
-        x = tf.nn.relu(x)
-       
-        x = self.conv2(x)
-        x = self.norm2([x, terrain_features])
-        x = self.attention([x, terrain_features])
-       
-        return tf.nn.relu(x + residual)
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "filters": self.filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "filters": self.filters
-            }
-        return {"filters": self.filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
-
-class ColorRefinementBlock(layers.Layer):
-    """Enhanced color refinement with spatial and semantic context"""
-    def __init__(self, filters, **kwargs):
-        super(ColorRefinementBlock, self).__init__(**kwargs)
-        self.filters = filters
-        self.context_conv = layers.Conv2D(filters, 3, padding='same')
-        self.terrain_norm = TerrainAdaptiveNormalization(filters)
-        self.attention = TerrainGuidedAttention(filters)
-        self.refine_conv = layers.Conv2D(filters, 1)
-        self.activation = layers.Activation('relu')
-        self._input_shape_tracker = None
-       
-    def build(self, input_shape):
-        if not isinstance(input_shape, (list, tuple)):
-            raise ValueError("ColorRefinementBlock expects a list of input shapes")
-           
-        x_shape, terrain_shape = input_shape
-       
-        # Build layers directly without shape manipulation
-        self.context_conv.build(x_shape)
-       
-        # Build normalization and attention with known filter size
-        conv_output_shape = tf.TensorShape(x_shape[:3]).concatenate(tf.TensorShape([self.filters]))
-       
-        self.terrain_norm.build([conv_output_shape, terrain_shape])
-        self.attention.build([conv_output_shape, terrain_shape])
-        self.refine_conv.build(conv_output_shape)
-        self._input_shape_tracker = input_shape
-       
-        super(ColorRefinementBlock, self).build(input_shape)
-       
-    def call(self, inputs, training=None):
-        if not isinstance(inputs, (list, tuple)) or len(inputs) != 2:
-            raise ValueError("ColorRefinementBlock expects [x, terrain_features] as input")
-       
-        x, terrain_features = inputs
-       
-        x = self.context_conv(x)
-        x = self.terrain_norm([x, terrain_features], training=training)
-        x = self.activation(x)
-        x = self.attention([x, terrain_features])
-        return self.refine_conv(x)
-       
-    def compute_output_shape(self, input_shape):
-        x_shape, _ = input_shape
-        return (x_shape[0], x_shape[1], x_shape[2], self.filters)
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "filters": self.filters,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-    def get_build_config(self):
-        if hasattr(self, '_input_shape_tracker') and self._input_shape_tracker is not None:
-            return {
-                "input_shape": self._input_shape_tracker,
-                "filters": self.filters
-            }
-        return {"filters": self.filters}
-       
-    def build_from_config(self, config):
-        if not self.built and "input_shape" in config:
-            self.build(config["input_shape"])
 
 class MemoryEfficientResBlock(layers.Layer):
     def __init__(self, filters, **kwargs):
@@ -753,67 +878,191 @@ class MemoryEfficientResBlock(layers.Layer):
         if not self.built and "input_shape" in config:
             self.build(config["input_shape"])
    
-class SiLUActivation(layers.Layer):
-    """Wrapper for SiLU activation"""
-    def call(self, x):
-        return tf.nn.silu(x)
-   
-    def get_config(self):
-        return super().get_config()
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-
-
 def build_terrain_aware_generator():
-    """Enhanced generator with fixed input shape"""
-    """Generator maintaining 128x128 output resolution"""
-    sar_input = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3])
-    terrain_input = layers.Input(shape=[len(TERRAIN_TYPES)])
-
-    # Initial processing without downsampling
-    x = layers.Conv2D(64, 3, strides=1, padding='same')(sar_input)
+    """Enhanced wavelet-based generator with memory optimization"""
+    # Input layers
+    sar_input = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], name='sar_input')
+    terrain_input = layers.Input(shape=[len(TERRAIN_TYPES)], name='terrain_input')
+    
+    # Initial feature extraction - keep resolution
+    x = layers.Conv2D(64, 7, padding='same', strides=1, 
+                     kernel_initializer=tf.keras.initializers.RandomNormal(0.0, 0.02),
+                     use_bias=True)(sar_input)
     x = InstanceNormalization()(x)
-    x = layers.Activation('silu')(x)
-
-    # Controlled downsampling to maintain resolution
+    x = layers.LeakyReLU(0.2)(x)
+    
+    # Process terrain features
+    terrain_features = layers.Dense(256, activation='relu')(terrain_input)
+    terrain_features = layers.Dropout(0.1)(terrain_features)  # Add dropout for generalization
+    terrain_features = layers.Dense(512, activation='relu')(terrain_features)
+    
+    # Initialize skip connections and filter sizes
     skip_connections = []
-    filter_sizes = [128, 256]  # Reduced number of downsamplings
-    for filters in filter_sizes:
-        skip_connections.append(x)
-        x = layers.Conv2D(filters, 4, strides=2, padding='same')(x)
-        x = InstanceNormalization()(x)
-        x = layers.Activation('silu')(x)
-
-    # Middle blocks at 32x32 resolution - use consistent filter size to prevent shape mismatch
-    for i in range(9):
-        # Use the same filter size as the last downsampling layer to maintain consistency
-        x = MemoryEfficientResBlock(256)([x, terrain_input])
-
-    # Upsampling back to 128x128
-    for skip, filters in zip(reversed(skip_connections), reversed(filter_sizes)):
-        x = layers.Conv2DTranspose(filters, 4, strides=2, padding='same')(x)
-        x = layers.Concatenate()([x, skip])
-        x = InstanceNormalization()(x)
-        x = layers.Activation('silu')(x)
-
-    # Final output at 128x128
-    outputs = layers.Conv2D(3, 3, padding='same', activation='tanh', dtype=tf.float32)(x)
-    return tf.keras.Model(inputs=[sar_input, terrain_input], outputs=outputs)
-
-class TileLayer(layers.Layer):
-    """Custom layer to tile the terrain_spatial tensor to match batch size"""
-    def call(self, inputs):
-        terrain_spatial, batch_size = inputs
-        return tf.tile(terrain_spatial, [batch_size, 1, 1, 1])
-   
-    def get_config(self):
-        return super().get_config()
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
+    filter_sizes = [64, 128, 256]
+    
+    # Encoder path with wavelet residual blocks
+    current_resolution = x
+    
+    for i, filters in enumerate(filter_sizes):
+        # Process with wavelet block BEFORE storing skip connection
+        wavelet_block = WaveletResidualBlock(filters)
+        current_resolution = wavelet_block(current_resolution)
+        
+        # Store skip connection AFTER processing but BEFORE downsampling
+        if i < len(filter_sizes) - 1:  # All but the last level need skip connections
+            skip_connections.append(current_resolution)
+            # Don't use tf.shape directly on KerasTensor - it causes errors
+        
+        # Downsample except for the last level
+        if i < len(filter_sizes) - 1:
+            current_resolution = layers.Conv2D(
+                filters*2, 4, strides=2, padding='same',
+                kernel_initializer=tf.keras.initializers.RandomNormal(0.0, 0.02)
+            )(current_resolution)
+            current_resolution = InstanceNormalization()(current_resolution)
+            current_resolution = layers.LeakyReLU(0.2)(current_resolution)
+    
+    # Bottleneck - reduced for memory efficiency
+    for i in range(6):  # Reduced from 9 to 6
+        # Apply terrain-guided attention in bottleneck
+        terrain_spatial = layers.Dense(256)(terrain_features)
+        
+        # Reshape to 1x1 spatial dimensions with 256 channels
+        terrain_spatial = layers.Reshape((1, 1, 256))(terrain_spatial)
+        
+        # Tile terrain features correctly
+        terrain_spatial = layers.Lambda(
+            lambda inputs: tf.tile(
+                inputs[0],  # terrain_spatial tensor
+                [1, tf.shape(inputs[1])[1], tf.shape(inputs[1])[2], 1]  # shape: [batch, height, width, channels]
+            )
+        )([terrain_spatial, current_resolution])
+        
+        # Add terrain conditioning
+        conditioned = layers.Add()([current_resolution, terrain_spatial])
+        
+        # Apply wavelet residual block
+        current_resolution = WaveletResidualBlock(
+            filter_sizes[-1], 
+            dropout_rate=0.1 if i % 2 == 0 else 0.0  # Alternate dropout
+        )(conditioned)
+    
+    # Decoder path with skip connections
+    for i, (skip, filters) in enumerate(zip(
+        reversed(skip_connections),
+        reversed(filter_sizes[:-1])  # Skip last filter size
+    )):
+        # Upsample
+        current_resolution = layers.Conv2DTranspose(
+            filters, 4, strides=2, padding='same',
+            kernel_initializer=tf.keras.initializers.RandomNormal(0.0, 0.02)
+        )(current_resolution)
+        current_resolution = InstanceNormalization()(current_resolution)
+        current_resolution = layers.LeakyReLU(0.2)(current_resolution)
+        
+        # Force current_resolution to match skip connection's spatial dimensions
+        # This ensures concatenation works regardless of rounding issues in Conv2DTranspose
+        current_resolution = layers.Lambda(
+            lambda x: tf.image.resize(x[0], [tf.shape(x[1])[1], tf.shape(x[1])[2]])
+        )([current_resolution, skip])
+        
+        # Apply adaptive skip connection weighting
+        skip_weight = layers.Conv2D(1, 1, activation='sigmoid')(skip)
+        weighted_skip = layers.Multiply()([skip, skip_weight])
+        
+        # Concatenate with skip connection
+        current_resolution = layers.Concatenate()([current_resolution, weighted_skip])
+        
+        # Apply wavelet residual block
+        current_resolution = WaveletResidualBlock(filters)(current_resolution)
+    
+    # Final output processing with edge enhancement
+    # Create a custom edge detection layer with proper shape handling
+    class EdgeDetectionLayer(layers.Layer):
+        """Custom layer for edge detection with explicit output shape"""
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            
+            # Define Sobel filters as constants
+            self.sobel_x = tf.constant([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], dtype=tf.float32)
+            self.sobel_y = tf.constant([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], dtype=tf.float32)
+            
+            # Reshape filters for convolution
+            self.sobel_x = tf.reshape(self.sobel_x, [3, 3, 1, 1])
+            self.sobel_y = tf.reshape(self.sobel_y, [3, 3, 1, 1])
+        
+        def call(self, inputs):
+            # Get input dtype to ensure consistent data types
+            input_dtype = inputs.dtype
+            
+            # Ensure inputs are 4D with shape [batch, height, width, channels]
+            if len(inputs.shape) > 4:
+                # Reshape if too many dimensions
+                inputs = tf.reshape(inputs, [-1, tf.shape(inputs)[1], tf.shape(inputs)[2], tf.shape(inputs)[-1]])
+            
+            # Cast inputs to float32 for convolution operation
+            inputs_f32 = tf.cast(inputs, tf.float32)
+            
+            # Process each channel separately
+            channels = tf.unstack(inputs_f32, axis=-1)
+            edges_x = []
+            edges_y = []
+            
+            for channel in channels:
+                # Add dimensions for batch and channels
+                channel = tf.reshape(channel, [-1, tf.shape(inputs)[1], tf.shape(inputs)[2]])
+                channel = tf.expand_dims(channel, -1)
+                
+                # Apply convolution using float32 for both inputs and filters
+                edge_x = tf.nn.conv2d(channel, self.sobel_x, strides=[1, 1, 1, 1], padding='SAME')
+                edge_y = tf.nn.conv2d(channel, self.sobel_y, strides=[1, 1, 1, 1], padding='SAME')
+                
+                # Always squeeze only the channel dimension (not batch)
+                edge_x = tf.squeeze(edge_x, axis=-1)
+                edge_y = tf.squeeze(edge_y, axis=-1)
+            
+                edges_x.append(edge_x)
+                edges_y.append(edge_y)
+            
+            # Stack back to image format - ensure proper dimensions
+            # Remove the conditional batch dimension logic
+            edge_x = tf.stack(edges_x, axis=-1)
+            edge_y = tf.stack(edges_y, axis=-1)
+            
+            # Calculate magnitude
+            edges = tf.sqrt(tf.square(edge_x) + tf.square(edge_y))
+            
+            # Cast back to original dtype
+            edges = tf.cast(edges, input_dtype)
+            
+            # Ensure output has the same batch and spatial dimensions as input
+            edges = tf.reshape(edges, tf.shape(inputs))
+            
+            return edges
+        
+        def compute_output_shape(self, input_shape):
+            # Output shape is the same as input shape
+            return input_shape
+    
+    # Apply edge detection using the custom layer
+    edges = EdgeDetectionLayer()(sar_input)
+    
+    # Final convolution blocks
+    x = layers.Conv2D(32, 3, padding='same')(current_resolution)
+    x = InstanceNormalization()(x)
+    x = layers.LeakyReLU(0.2)(x)
+    
+    # Use edges to enhance final output
+    edge_weight = layers.Conv2D(1, 1, activation='sigmoid')(edges)
+    edge_features = layers.Concatenate()([x, edge_weight * edges])
+    
+    # Final output with tanh activation
+    outputs = layers.Conv2D(
+        3, 7, padding='same', activation='tanh', dtype=tf.float32,
+        kernel_initializer=tf.keras.initializers.RandomNormal(0.0, 0.02)
+    )(edge_features)
+    
+    return tf.keras.Model(inputs=[sar_input, terrain_input], outputs=outputs, name="WaveletSARColorizer")
 
 class TerrainSpatialLayer(layers.Layer):
     """Layer to handle terrain spatial features with explicit tensor shapes"""
@@ -857,147 +1106,110 @@ class TerrainSpatialLayer(layers.Layer):
             self.build(config["input_shape"])
 
 def build_terrain_aware_discriminator():
-    """Discriminator with proper tensor shape handling"""
-    # Fix input layer declarations with explicit batch_size keyword argument
-    input_image = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], batch_size=None)
-    target_image = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], batch_size=None)
-    terrain_input = layers.Input(shape=[len(TERRAIN_TYPES)], batch_size=None)
-   
-    # Process terrain features
-    terrain_features = layers.Dense(512, activation='relu')(terrain_input)
-   
-    # Fix TerrainSpatialLayer call with proper batch size handling
-    terrain_spatial = TerrainSpatialLayer(height=IMG_HEIGHT, width=IMG_WIDTH)(terrain_input)
-   
-    # Combine inputs
-    x = layers.Concatenate()([input_image, target_image, terrain_spatial])
-   
-    # Original discriminator architecture
+    """Enhanced multi-scale discriminator with spectral normalization"""
+    # Input layers
+    input_image = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], name="input_image")
+    target_image = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], name="target_image")
+    terrain_input = layers.Input(shape=[len(TERRAIN_TYPES)], name="terrain_type")
+    
+    # Process terrain features efficiently
+    terrain_features = layers.Dense(256, activation='relu')(terrain_input)
+    terrain_features = layers.Dense(512, activation='relu')(terrain_features)
+    
+    # Create terrain spatial representation
+    terrain_spatial = layers.Dense(256)(terrain_input)
+    terrain_spatial = layers.Dense(IMG_HEIGHT * IMG_WIDTH)(terrain_spatial)
+    terrain_spatial = layers.Reshape((IMG_HEIGHT, IMG_WIDTH, 1))(terrain_spatial)
+    
+    # Combine inputs - Using layers.Concatenate
+    x = layers.Concatenate(axis=-1)([input_image, target_image, terrain_spatial])
+    
+    # Helper function to apply spectral normalization to Conv2D layers
+    def snconv2d(x, filters, kernel_size=4, strides=2, padding='same'):
+        conv = layers.Conv2D(
+            filters, kernel_size, strides=strides, padding=padding,
+            kernel_initializer=tf.keras.initializers.RandomNormal(0.0, 0.02),
+            use_bias=False
+        )
+        # Build the layer first to ensure the kernel is created
+        input_shape = tf.keras.backend.int_shape(x)
+        conv.build(input_shape)
+        # Then wrap with spectral normalization
+        return SpectralNormalization(conv)(x)
+    
+    # Create discriminators at multiple scales (original, 1/2, and 1/4)
     outputs = []
-    for scale in [1, 2]:
-        if scale != 1:
-            current_input = layers.AveragePooling2D(scale)(x)
+    feature_maps = []
+    
+    for scale, downscale in enumerate([1, 2, 4]):
+        if scale > 0:
+            # Use average pooling for downsampling
+            current_input = layers.AveragePooling2D(downscale)(x)
         else:
             current_input = x
-           
-        features = current_input
-        for filters in [64, 128, 256]:
-            features = layers.Conv2D(filters, 4, strides=2, padding='same')(features)
-            features = TerrainAdaptiveNormalization(filters)([features, terrain_features])
-            features = layers.LeakyReLU(0.2)(features)
-            features = TerrainGuidedAttention(filters)([features, terrain_features])
-       
-        output = layers.Conv2D(1, 4, strides=1, padding='same')(features)
-        outputs.append(output)
+        
+        # Track features for feature matching loss
+        scale_features = []
+        
+        # First layer - no normalization
+        d = snconv2d(current_input, 64, strides=2)
+        d = layers.LeakyReLU(0.2)(d)
+        scale_features.append(d)
+        
+        # Second layer
+        d = snconv2d(d, 128, strides=2)
+        d = InstanceNormalization()(d)
+        d = layers.LeakyReLU(0.2)(d)
+        scale_features.append(d)
+        
+        # Apply terrain conditioning using Keras layers instead of tf operations
+        terrain_gamma = layers.Dense(128)(terrain_features)
+        terrain_beta = layers.Dense(128)(terrain_features)
+        
+        # Use Lambda layers to handle reshaping with dynamic batch sizes
+        terrain_gamma = layers.Lambda(lambda x: tf.reshape(x, [-1, 1, 1, 128]))(terrain_gamma)
+        terrain_beta = layers.Lambda(lambda x: tf.reshape(x, [-1, 1, 1, 128]))(terrain_beta)
+        
+        # Apply conditioning
+        d = layers.Multiply()([d, (1.0 + terrain_gamma)])
+        d = layers.Add()([d, terrain_beta])
+        
+        # Third layer
+        d = snconv2d(d, 256, strides=2)
+        d = InstanceNormalization()(d)
+        d = layers.LeakyReLU(0.2)(d)
+        scale_features.append(d)
+        
+        # Apply CBAM attention
+        d = CBAM(256)(d)
+        
+        # Fourth layer
+        d = snconv2d(d, 512, strides=1)  # No downsampling
+        d = InstanceNormalization()(d)
+        d = layers.LeakyReLU(0.2)(d)
+        scale_features.append(d)
+        
+        # Final layer for discrimination
+        d_out = layers.Conv2D(1, 4, strides=1, padding='same')(d)
+        
+        # Store output and features
+        outputs.append(d_out)
+        feature_maps.append(scale_features)
+    
+    # Flatten feature maps for easier access
+    flattened_features = []
+    for scale_feats in feature_maps:
+        flattened_features.extend(scale_feats)
+    
+    # Create model with both outputs and feature maps for feature matching
+    all_outputs = outputs + [flattened_features]
+    return tf.keras.Model(
+        inputs=[input_image, target_image, terrain_input], 
+        outputs=all_outputs,
+        name="MultiScaleDiscriminator"
+    )
 
-    return tf.keras.Model(inputs=[input_image, target_image, terrain_input], outputs=outputs)
-
-class DebugGenerator(tf.keras.Model):
-    def __init__(self, base_generator):
-        super(DebugGenerator, self).__init__()
-        self.base_generator = base_generator
-
-    def call(self, inputs, training=None):
-        tf.print("\nGenerator input shapes:", [tf.shape(x) for x in inputs])
-        output = self.base_generator(inputs, training=training)
-        tf.print("Generator output shape:", tf.shape(output))
-        return output
-
-class DynamicWeightedLoss(layers.Layer):
-    """Adaptive loss weighting based on training dynamics"""
-    def __init__(self, num_losses, **kwargs):
-        super(DynamicWeightedLoss, self).__init__(**kwargs)
-        self.loss_weights = self.add_weight(
-            "loss_weights",
-            shape=[num_losses],
-            initializer="ones",
-            trainable=True
-        )
-       
-    def call(self, losses):
-        weights = tf.nn.softmax(self.loss_weights)
-        return tf.reduce_sum([w * l for w, l in zip(weights, losses)])
-   
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "num_losses": self.num_losses,
-        })
-        return config
-       
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-   
-
-class AdaptiveLRSchedule:
-    def __init__(self, initial_lr=2e-4, min_lr=1e-6, patience=5, factor=0.5, metric_window=10):
-        self.current_lr = initial_lr
-        self.min_lr = min_lr
-        self.patience = self.patience
-        self.factor = self.factor
-        self.metric_window = metric_window
-        self.best_metric = float('inf')
-        self.patience_counter = 0
-        self.metrics_history = []
-       
-    def update(self, current_metric):
-        """Update learning rate based on metric history"""
-        self.metrics_history.append(current_metric)
-       
-        # Only update after collecting enough metrics
-        if len(self.metrics_history) < self.metric_window:
-            return self.current_lr
-           
-        # Calculate moving average
-        avg_metric = sum(self.metrics_history[-self.metric_window:]) / self.metric_window
-       
-        if avg_metric < self.best_metric:
-            self.best_metric = avg_metric
-            self.patience_counter = 0
-        else:
-            self.patience_counter += 1
-           
-        # Reduce learning rate if patience is exceeded
-        if self.patience_counter >= self.patience:
-            self.current_lr = max(self.current_lr * self.factor, self.min_lr)
-            self.patience_counter = 0
-            print(f"\nReducing learning rate to: {self.current_lr:.2e}")
-           
-        # Keep only recent metrics
-        if len(self.metrics_history) > self.metric_window * 2:
-            self.metrics_history = self.metrics_history[-self.metric_window:]
-           
-        return self.current_lr
-
-
-def compute_gradient_penalty(discriminator, real_images, fake_images, terrain_labels):
-    """Gradient penalty calculation with proper dtype handling"""
-    # Convert inputs to fp32 for accurate gradient calculation
-    real_images = tf.cast(real_images, tf.float32)
-    fake_images = tf.cast(fake_images, tf.float32)
-    terrain_labels = tf.cast(terrain_labels, tf.float32)
-   
-    # Use dynamic batch size
-    alpha = tf.random.uniform(
-        [tf.shape(real_images)[0], 1, 1, 1], 0.0, 1.0, dtype=tf.float32
-    )  # changed code
-   
-    diff = fake_images - real_images
-    interpolated = real_images + alpha * diff
-   
-    with tf.GradientTape() as gp_tape:
-        gp_tape.watch(interpolated)
-        pred = discriminator([interpolated, interpolated, terrain_labels], training=True)
-       
-    grads = gp_tape.gradient(pred, [interpolated])[0]
-    norm = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]))
-    gp = tf.reduce_mean((norm - 1.0) ** 2)
-   
-    # Convert back to fp16
-    return tf.cast(gp, tf.float16)
-
-def generator_loss(disc_generated_output, generated_images, target_images):
+def generator_loss(disc_generated_output, generated_images, target_images, generator_model=None):
     """Generator loss function with fp32 for loss calculations and NaN checks"""
     # Convert inputs to fp32 for loss calculation
     generated_images_f32 = tf.cast(generated_images, tf.float32)
@@ -1062,9 +1274,16 @@ def generator_loss(disc_generated_output, generated_images, target_images):
     lambda_val = tf.cast(LAMBDA, tf.float32)
    
     # Use small weight for perceptual loss to prevent it from dominating
-    perceptual_weight = tf.constant(0.05, dtype=tf.float32)
+    perceptual_weight = tf.constant(0.05, dtype=tf.float32)  # Increased from 0.075 to 0.2
    
-    total_loss_f32 = gan_loss + (lambda_val * l1_loss) + (lambda_val * perceptual_weight * perceptual_loss)
+    # Add spectral regularization to prevent mode collapse
+    spectral_reg = tf.constant(0.0, dtype=tf.float32)
+    if generator_model is not None:
+        spectral_reg = 0.0001 * tf.reduce_mean([tf.reduce_mean(tf.square(w))
+                                              for w in generator_model.trainable_variables
+                                              if 'kernel' in w.name])
+                                         
+    total_loss_f32 = gan_loss + (lambda_val * l1_loss) + (lambda_val * perceptual_weight * perceptual_loss) + spectral_reg
    
     # Final NaN check
     total_loss_f32 = tf.where(tf.math.is_finite(total_loss_f32), total_loss_f32,
@@ -1087,8 +1306,8 @@ def discriminator_loss(disc_real_output, disc_generated_output):
         output_f32 = tf.cast(output, tf.float32)
         # Clip discriminator outputs to prevent extreme values
         output_f32 = tf.clip_by_value(output_f32, -20.0, 20.0)
-        # Use epsilon for numerical stability
-        labels = tf.ones_like(output_f32)
+        # Use one-sided label smoothing (0.9 instead of 1.0) for real labels
+        labels = 0.9 * tf.ones_like(output_f32)
         per_output_loss = loss_fn(labels, output_f32)
         # Handle NaN values
         per_output_loss = tf.where(tf.math.is_finite(per_output_loss), per_output_loss, tf.zeros_like(per_output_loss))
@@ -1156,7 +1375,8 @@ def compute_gradient_penalty(discriminator, real_images, fake_images, terrain_la
     # Clip gradient norm to prevent extreme values
     norm = tf.clip_by_value(norm, 0.0, 10.0)
    
-    gp = tf.reduce_mean((norm - 1.0) ** 2)
+    # Reduce gradient penalty coefficient to prevent discriminator dominance
+    gp = tf.reduce_mean((norm - 1.0) ** 2) * 0.5  # Multiplier reduced from 1.0 to 0.5
    
     # Final NaN check
     gp = tf.where(tf.math.is_finite(gp), gp, tf.constant(0.0, dtype=tf.float32))
@@ -1216,7 +1436,7 @@ def train_step(sar_images, color_images, terrain_labels, generator, discriminato
             loss_scale = tf.constant(128.0, dtype=tf.float32)
            
             # Calculate generator losses with safe ops
-            gen_loss_result = generator_loss(disc_generated_output, generated_images_f32, color_images)
+            gen_loss_result = generator_loss(disc_generated_output, generated_images_f32, color_images, generator)
             gen_total_loss, gan_loss, l1_loss, perceptual_loss, psnr, ssim = gen_loss_result
            
             # Apply loss scaling for numerical stability in mixed precision
@@ -1324,7 +1544,6 @@ def train_step(sar_images, color_images, terrain_labels, generator, discriminato
             'gen_total_loss': 0.0,
             'disc_loss': 0.0,
             'l1_loss': 0.0,
-            'style_loss': 0.0,
             'psnr': 0.0,
             'ssim': 0.0,
             'cycle_loss': 0.0,
@@ -1344,7 +1563,6 @@ def train_step(sar_images, color_images, terrain_labels, generator, discriminato
         'gen_total_loss': tf.where(tf.math.is_finite(gen_total_loss), gen_total_loss, 0.0),
         'disc_loss': tf.where(tf.math.is_finite(disc_loss), disc_loss, 0.0),
         'l1_loss': tf.where(tf.math.is_finite(l1_loss), l1_loss, 0.0),
-        'style_loss': tf.where(tf.math.is_finite(feature_matching_loss), feature_matching_loss, 0.0),
         'psnr': tf.where(tf.math.is_finite(psnr), psnr, 0.0),
         'ssim': tf.where(tf.math.is_finite(ssim), ssim, 0.0),
         'cycle_loss': tf.where(tf.math.is_finite(cycle_loss), cycle_loss, 0.0),
@@ -1357,984 +1575,304 @@ def train_step(sar_images, color_images, terrain_labels, generator, discriminato
 
 # Update history initialization to remove style_loss
 def get_initial_history():
+    """Initialize history dictionary with all metrics"""
     return {
         'gen_loss': [], 'disc_loss': [],
         'psnr': [], 'ssim': [],
         'cycle_loss': [], 'l2_loss': [],
         'feature_matching_loss': [],
         'lpips': [],
-        'l1_loss': [],
+        'l1_loss': [], 
         'perceptual_loss': [],
+        'edge_consistency': [],
+        'color_fidelity': [],
         'val_gen_loss': [], 'val_disc_loss': [],
         'val_psnr': [], 'val_ssim': [],
         'val_l1_loss': [], 'val_l2_loss': [],
-        'val_perceptual_loss': [], 'val_cycle_loss': [],
+        'val_cycle_loss': [],
         'val_feature_matching_loss': [],
         'val_lpips': [],
+        'val_perceptual_loss': [],
+        'val_edge_consistency': [],
+        'val_color_fidelity': [],
         'fid': [], 'val_fid': []
     }
 
-# Update the train function to use new history initialization
-def train(train_dataset, val_dataset, epochs, resume_training=True):
-    """Modified training function with validation set integration and comprehensive metrics"""
-   
-    if not isinstance(strategy, tf.distribute.Strategy):
-        raise ValueError("No distribution strategy found!")
-   
-    num_replicas = strategy.num_replicas_in_sync
-    global_batch_size = BATCH_SIZE * num_replicas
-   
-    # Create visualization directory
+# Define the detailed metrics calculation function
+def calculate_detailed_metrics(sar_batch, color_batch, generated_images, cycle_reconstructed, terrain_batch):
+    """Calculate comprehensive metrics for test evaluation"""
+    metrics_dict = {}
+    
+    # Calculate standard image quality metrics
+    psnr = tf.image.psnr(
+        tf.clip_by_value(color_batch, -1.0, 1.0),
+        tf.clip_by_value(generated_images, -1.0, 1.0),
+        max_val=2.0
+    )
+    metrics_dict['psnr'] = tf.reduce_mean(psnr)
+    
+    ssim = tf.image.ssim(
+        tf.clip_by_value(color_batch, -1.0, 1.0),
+        tf.clip_by_value(generated_images, -1.0, 1.0),
+        max_val=2.0
+    )
+    metrics_dict['ssim'] = tf.reduce_mean(ssim)
+    
+    # L1 and L2 losses
+    metrics_dict['l1_loss'] = tf.reduce_mean(tf.abs(color_batch - generated_images))
+    metrics_dict['l2_loss'] = tf.reduce_mean(tf.square(color_batch - generated_images))
+    
+    # Cycle consistency
+    metrics_dict['cycle_loss'] = tf.reduce_mean(tf.abs(sar_batch - cycle_reconstructed))
+    
+    # Add task-specific metrics
+    metrics_dict = calculate_task_specific_metrics(color_batch, generated_images, metrics_dict)
+    
+    return metrics_dict
+
+# Add function to handle training issues
+def handle_training_issues(generator_optimizer, discriminator_optimizer):
+    """Check for and fix optimizer issues"""
+    try:
+        nan_detected = False
+        
+        # Check generator optimizer for NaN
+        for var in generator_optimizer.weights:
+            if tf.reduce_any(tf.math.is_nan(var)):
+                nan_detected = True
+                break
+        
+        if nan_detected:
+            print("Detected NaN in generator optimizer, resetting...")
+            generator_optimizer = reset_optimizer_state(generator_optimizer)
+        
+        # Reset nan_detected flag
+        nan_detected = False
+        
+        # Check discriminator optimizer for NaN
+        for var in discriminator_optimizer.weights:
+            if tf.reduce_any(tf.math.is_nan(var)):
+                nan_detected = True
+                break
+        
+        if nan_detected:
+            print("Detected NaN in discriminator optimizer, resetting...")
+            discriminator_optimizer = reset_optimizer_state(discriminator_optimizer)
+        
+        return generator_optimizer, discriminator_optimizer
+    except Exception as e:
+        print(f"Error handling training issues: {e}")
+        return generator_optimizer, discriminator_optimizer
+
+# Define train function
+def train(train_dataset, val_dataset, epochs=200, resume_training=True):
+    """Main training function that manages the training and validation processes"""
+    # Configuration
+    LEARNING_RATE = 2e-4
+    BETA_1 = 0.5
+    BETA_2 = 0.999
+    ACCUMULATION_STEPS = 4  # Gradient accumulation steps
+    
+    # Paths for saving models and visualizations
+    model_dir = '/kaggle/working/checkpoints'
     visualization_dir = '/kaggle/working/visualizations'
+    os.makedirs(model_dir, exist_ok=True)
     os.makedirs(visualization_dir, exist_ok=True)
-   
+    
+    # Prepare distributed datasets
+    dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
+    dist_val_dataset = strategy.experimental_distribute_dataset(val_dataset)
+    
+    # Set a small subset of validation data for visualization
+    val_vis_dataset = val_dataset.take(5)
+    
+    # Early stopping parameters
+    patience = 15
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
+    # Initialize or load models
     with strategy.scope():
-        # Load or initialize models and training history
-        if resume_training:
-            loaded_gen, loaded_disc, loaded_history = load_latest_models()
-            if loaded_gen is not None:
-                generator = loaded_gen
-                discriminator = loaded_disc
-                start_epoch = loaded_history.get('epoch', 0) + 1
-                history = loaded_history.get('history', get_initial_history())
-                print(f"Resuming training from epoch {start_epoch}")
-            else:
-                generator = build_terrain_aware_generator()
-                discriminator = build_terrain_aware_discriminator()
-                start_epoch = 0
-                history = get_initial_history()
-        else:
-            generator = build_terrain_aware_generator()
-            discriminator = build_terrain_aware_discriminator()
-            start_epoch = 0
-            history = get_initial_history()
-       
-        # Initialize optimizers with gradient clipping using the standard optimizer
-        generator_optimizer = tf.keras.optimizers.Adam(
-            1e-4,  # Lower learning rate for stability
-            beta_1=0.5,
-            clipnorm=1.0  # Add gradient clipping
-        )
-        discriminator_optimizer = tf.keras.optimizers.Adam(
-            1e-4,  # Lower learning rate for stability
-            beta_1=0.5,
-            clipnorm=1.0  # Add gradient clipping
-        )
-        metrics_tracker = MetricsTracker()
-       
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
-        dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
-       
-        # Create validation dataset for visualization
-        val_vis_dataset = val_dataset.take(5).cache()
-       
-        @tf.function
-        def distributed_train_step(dist_inputs):
-            """Fixed distribution-aware training step with proper error handling"""
-            def train_step_fn(inputs):
-                sar_images, color_images, terrain_labels = inputs
-               
-                # Add numerical stability measures
-                sar_images = tf.clip_by_value(sar_images, -1.0, 1.0)
-                color_images = tf.clip_by_value(color_images, -1.0, 1.0)
-               
-                # Default loss values
-                gen_loss = tf.constant(0.1, dtype=tf.float16)
-                disc_loss = tf.constant(0.1, dtype=tf.float32)
-               
-                try:
-                    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
-                        per_replica_scaling = 1.0 / strategy.num_replicas_in_sync
-                       
-                        # Generator forward pass with error checking
-                        generated_images = generator([sar_images, terrain_labels], training=True)
-                        generated_images = tf.where(
-                            tf.math.is_finite(generated_images),
-                            generated_images,
-                            tf.zeros_like(generated_images)
-                        )
-                        generated_images = tf.clip_by_value(generated_images, -1.0, 1.0)
-                       
-                        # Discriminator forward passes
-                        disc_real_output = discriminator([sar_images, color_images, terrain_labels], training=True)
-                        disc_generated_output = discriminator([sar_images, generated_images, terrain_labels], training=True)
-                       
-                        # Calculate losses with scaling and NaN protection
-                        losses = generator_loss(disc_generated_output, generated_images, color_images)
-                        gen_loss = losses[0] * per_replica_scaling
-                        gen_loss = tf.where(tf.math.is_finite(gen_loss), gen_loss, tf.constant(0.1, dtype=tf.float16))
-                       
-                        disc_loss = discriminator_loss(disc_real_output, disc_generated_output) * per_replica_scaling
-                        disc_loss = tf.where(tf.math.is_finite(disc_loss), disc_loss, tf.constant(0.1, dtype=tf.float32))
-                       
-                        # Add small constant to prevent complete loss of gradients
-                        gen_loss = gen_loss + 1e-8
-                        disc_loss = disc_loss + 1e-8
-               
-                    # Compute and apply gradients with nan/inf handling
-                    gen_gradients = gen_tape.gradient(gen_loss, generator.trainable_variables)
-                    disc_gradients = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
-                   
-                    # Replace NaN gradients with zeros
-                    gen_gradients = [
-                        tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
-                        if g is not None else None for g in gen_gradients
-                    ]
-                    disc_gradients = [
-                        tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
-                        if g is not None else None for g in disc_gradients
-                    ]
-                   
-                    # Clip gradients for stability
-                    gen_gradients = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in gen_gradients]
-                    disc_gradients = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in disc_gradients]
-                   
-                    generator_optimizer.apply_gradients(zip(gen_gradients, generator.trainable_variables))
-                    discriminator_optimizer.apply_gradients(zip(disc_gradients, discriminator.trainable_variables))
-                except Exception as e:
-                    # Just log the error without passing it outside strategy.run
-                    tf.print("Error in replica:", e)
-               
-                return gen_loss, disc_loss
-           
-            # Run the training function on each replica
-            per_replica_losses = strategy.run(train_step_fn, args=(dist_inputs,))
-           
-            # Properly extract the per-replica losses using get_replica_context
-            per_replica_gen_loss, per_replica_disc_loss = per_replica_losses
-           
-            # Explicitly extract values from PerReplica objects
-            # Use strategy.reduce within the distribution context
-            reduced_gen_loss = strategy.reduce(
-                tf.distribute.ReduceOp.SUM, per_replica_gen_loss, axis=None
-            )
-            reduced_disc_loss = strategy.reduce(
-                tf.distribute.ReduceOp.SUM, per_replica_disc_loss, axis=None
-            )
-           
-            # Final NaN check on reduced values
-            reduced_gen_loss = tf.where(
-                tf.math.is_finite(reduced_gen_loss),
-                reduced_gen_loss,
-                tf.constant(0.1, dtype=reduced_gen_loss.dtype)
-            )
-            reduced_disc_loss = tf.where(
-                tf.math.is_finite(reduced_disc_loss),
-                reduced_disc_loss,
-                tf.constant(0.1, dtype=reduced_disc_loss.dtype)
-            )
-           
-            return reduced_gen_loss, reduced_disc_loss
-       
-        # Learning rate scheduler with exponential decay for stability
-        gen_lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-            initial_learning_rate=1e-5,  # Start with even lower learning rate
-            decay_steps=1000,
-            decay_rate=0.95
-        )
-        disc_lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-            initial_learning_rate=1e-5,  # Start with lower learning rate
-            decay_steps=1000,
-            decay_rate=0.95
-        )
-       
-        # Update optimizers with schedules
-        generator_optimizer.learning_rate = gen_lr_schedule
-        discriminator_optimizer.learning_rate = disc_lr_schedule
-       
-        # Now use the distributed_train_step in your training loop
-        for epoch in range(start_epoch, start_epoch + epochs):
-            start = time.time()
-           
-            # Training phase
-            nan_count = 0
-            steps_per_epoch = 0
-            total_gen_loss = 0
-            total_disc_loss = 0
-           
-            # Initialize epoch metrics tracker with all metrics
-            epoch_metrics = {
-                'gen_loss': 0.0, 'disc_loss': 0.0,
-                'psnr': 0.0, 'ssim': 0.0,
-                'cycle_loss': 0.0, 'l2_loss': 0.0,
-                'feature_matching_loss': 0.0,
-                'lpips': 0.0, 'l1_loss': 0.0,
-                'perceptual_loss': 0.0,
-                'val_gen_loss': 0.0, 'val_disc_loss': 0.0,
-                'val_psnr': 0.0, 'val_ssim': 0.0,
-                'val_l1_loss': 0.0, 'val_l2_loss': 0.0,
-                'val_perceptual_loss': 0.0, 'val_cycle_loss': 0.0,
-                'val_feature_matching_loss': 0.0,
-                'val_lpips': 0.0, 'fid': 0.0, 'val_fid': 0.0
-            }
-           
-            # Training loop
-            try:
-                # Use a Python for loop instead of enumerate to avoid issues with PerReplica
-                # This ensures all operations happen within the distribution context
-                for step, dist_inputs in enumerate(dist_dataset):
-                    steps_per_epoch += 1
-                    try:
-                        # Run the distributed training step
-                        gen_loss, disc_loss = distributed_train_step(dist_inputs)
-                       
-                        # Convert to host tensor values
-                        gen_loss_val = gen_loss.numpy()
-                        disc_loss_val = disc_loss.numpy()
-                       
-                        # Check for NaN and track
-                        if np.isnan(gen_loss_val) or np.isnan(disc_loss_val):
-                            nan_count += 1
-                            if nan_count > 5:  # Reset if too many NaNs in a row
-                                print("\nToo many NaN values, resetting optimizer states...")
-                                # Use list comprehension to avoid PerReplica issues
-                                for var in generator_optimizer.variables():
-                                    var.assign(tf.zeros_like(var))
-                                for var in discriminator_optimizer.variables():
-                                    var.assign(tf.zeros_like(var))
-                                nan_count = 0
-                           
-                            # Use default values for display
-                            gen_loss_val = 0.1
-                            disc_loss_val = 0.1
-                           
-                        total_gen_loss += gen_loss_val
-                        total_disc_loss += disc_loss_val
-                       
-                        # Calculate detailed metrics every 50 steps for monitoring
-                        if step % 50 == 0 and step > 0:
-                            try:
-                                # Extract first batch for detailed metrics
-                                sar_batch, color_batch, terrain_batch = next(iter(val_vis_dataset))
-                               
-                                # Generate images
-                                generated_images = generator([sar_batch, terrain_batch], training=False)
-                               
-                                # Calculate cycle reconstruction
-                                cycle_reconstructed = generator([generated_images, terrain_batch], training=False)
-                               
-                                # Calculate detailed metrics
-                                detailed_metrics = calculate_detailed_metrics(
-                                    sar_batch, color_batch, generated_images, cycle_reconstructed, terrain_batch
-                                )
-                               
-                                # Update epoch metrics with detailed values
-                                for key, value in detailed_metrics.items():
-                                    if key in epoch_metrics:
-                                        epoch_metrics[key] += value
-                               
-                                # Print detailed metrics including FID
-                                metrics_str = ", ".join([f"{k}: {v:.4f}" for k, v in detailed_metrics.items()])
-                                # Print FID prominently
-                                fid_value = detailed_metrics.get('fid', 0.0)
-                                #print(f"\nStep {step} detailed metrics - FID: {fid_value:.4f} | {metrics_str}")
-                               
-                            except Exception as metrics_err:
-                                print(f"\nError calculating detailed metrics: {metrics_err}")
-                       
-                        if step % 10 == 0:
-                            avg_gen = total_gen_loss / (step + 1)
-                            avg_disc = total_disc_loss / (step + 1)
-                           
-                            # Add FID to regular status updates if available
-                            fid_str = ""
-                            if 'fid' in epoch_metrics and epoch_metrics['fid'] > 0:
-                                avg_fid = epoch_metrics['fid'] / max(1, steps_per_epoch // 50)
-                                fid_str = f", FID: {avg_fid:.4f}"
-                               
-                            #print(f"\rStep {step} - Gen Loss: {avg_gen:.4f}, Disc Loss: {avg_disc:.4f}{fid_str}", end='')
-                           
-                    except tf.errors.ResourceExhaustedError:
-                        print("\nResource exhausted, skipping batch")
-                        continue
-                    except Exception as e:
-                        print(f"\nException in training loop: {e}")
-                        continue
-            except Exception as main_exception:
-                print(f"\nMain training loop exception: {main_exception}")
-           
-            # Log average losses per epoch
-            if steps_per_epoch > 0:
-                avg_gen_loss = total_gen_loss / steps_per_epoch
-                avg_disc_loss = total_disc_loss / steps_per_epoch
-                history['gen_loss'].append(float(avg_gen_loss))
-                history['disc_loss'].append(float(avg_disc_loss))
-               
-                # Update other metrics in history
-                for key in epoch_metrics:
-                    if key not in ['gen_loss', 'disc_loss'] and not key.startswith('val_'):
-                        # Only add to history if we have valid measurements
-                        if epoch_metrics[key] > 0:
-                            history[key].append(float(epoch_metrics[key] / max(steps_per_epoch // 50, 1)))
-           
-               
-                # Print loss metrics
-                gen_loss = get_latest_metric(history, 'gen_loss')
-                disc_loss = get_latest_metric(history, 'disc_loss')
-                psnr = get_latest_metric(history, 'psnr')
-                ssim = get_latest_metric(history, 'ssim')
-                l1_loss = get_latest_metric(history, 'l1_loss')
-                l2_loss = get_latest_metric(history, 'l2_loss')
-                perceptual = get_latest_metric(history, 'perceptual_loss')
-                feature_matching = get_latest_metric(history, 'feature_matching_loss')
-                cycle_loss = get_latest_metric(history, 'cycle_loss')
-                lpips = get_latest_metric(history, 'lpips')
-                fid = get_latest_metric(history, 'fid', 0.0)  # Get FID with default 0.0
-                print(f"│ Epoch {epoch + 1}/{start_epoch + epochs} (Training) : gen_loss: {gen_loss:.4f} | disc_loss: {disc_loss:.4f} | cycle_loss: {cycle_loss:.4f} | psnr: {psnr:.4f} | ssim: {ssim:.4f} | l1_loss: {l1_loss:.4f} | l2_loss: {l2_loss:.4f} | feature_matching: {feature_matching:.4f} | lpips: {lpips:.4f} | FID: {fid:.4f}")
-           
-            # Validation phase
-            print("\nRunning validation...")
-            val_metrics = {
-                'gen_loss': [],
-                'disc_loss': [],
-                'psnr': [],
-                'ssim': [],
-                'l1_loss': [],
-                'l2_loss': [],
-                'perceptual_loss': [],
-                'style_loss': [],
-                'feature_matching_loss': [],
-                'cycle_loss': [],
-                'lpips': [], 'fid': []
-            }
-           
-            # Process validation batch by batch to collect detailed metrics
-            all_val_generated_images = []
-            all_val_real_images = []
-           
-            for val_batch in val_dataset:
-                sar_batch, color_batch, terrain_batch = val_batch
-               
-                # Generate images without training
-                generated_images = generator([sar_batch, terrain_batch], training=False)
-               
-                # Calculate cycle reconstructions for cycle consistency
-                cycle_reconstructed = generator([generated_images, terrain_batch], training=False)
-               
-                # Calculate validation metrics
-                disc_real_output = discriminator([sar_batch, color_batch, terrain_batch], training=False)
-                disc_generated_output = discriminator([sar_batch, generated_images, terrain_batch], training=False)
-               
-                # Calculate generator loss
-                gen_loss_result = generator_loss(disc_generated_output, generated_images, color_batch)
-                gen_total_loss, _, l1_loss, perceptual_loss, psnr, ssim = gen_loss_result
-               
-                # Calculate discriminator loss
-                disc_loss = discriminator_loss(disc_real_output, disc_generated_output)
-               
-                # Calculate detailed metrics
-                detailed_metrics = calculate_detailed_metrics(
-                    sar_batch, color_batch, generated_images, cycle_reconstructed, terrain_batch
-                )
-               
-                # Print per-batch FID for validation
-               
-               
-                # Store all validation metrics
-                val_metrics['gen_loss'].append(gen_total_loss.numpy())
-                val_metrics['disc_loss'].append(disc_loss.numpy())
-                val_metrics['psnr'].append(psnr.numpy())
-                val_metrics['ssim'].append(ssim.numpy())
-                val_metrics['l1_loss'].append(l1_loss.numpy())
-                val_metrics['perceptual_loss'].append(perceptual_loss.numpy())
-               
-                # Add other metrics from detailed calculation
-                for key, value in detailed_metrics.items():
-                    if key in val_metrics and key not in ['psnr', 'ssim', 'l1_loss', 'perceptual_loss']:
-                        val_metrics[key].append(value)
-           
-            # Calculate FID on larger combined validation set for more accurate measurement
-            try:
-                if len(all_val_generated_images) > 0:
-                    combined_generated = tf.concat(all_val_generated_images, axis=0)
-                    combined_real = tf.concat(all_val_real_images, axis=0)
-                   
-                    if combined_generated.shape[0] >= 16:  # Enough samples for meaningful FID
-                        combined_fid = calculate_fid_score(combined_real, combined_generated)
-                        print(f"\nValidation FID on combined set ({combined_generated.shape[0]} images): {combined_fid.numpy():.4f}")
-                       
-                        # Add to metrics
-                        if 'fid' in avg_val_metrics:
-                            avg_val_metrics['fid'] = combined_fid.numpy()
-            except Exception as combined_fid_err:
-                print(f"Error calculating combined validation FID: {combined_fid_err}")
-           
-            # Calculate average validation metrics
-            avg_val_metrics = {k: np.mean(v) for k, v in val_metrics.items() if len(v) > 0}
-           
-            # Update history with validation metrics
-            for key, value in avg_val_metrics.items():
-                val_key = f'val_{key}'
-                if val_key in history:
-                    history[val_key].append(float(value))
-           
-            # Update epoch metrics dictionary
-            for key, value in avg_val_metrics.items():
-                val_key = f'val_{key}'
-                epoch_metrics[val_key] = float(value)
-           
-           
-            # Print validation metrics using safe dictionary access
-            gen_loss = avg_val_metrics.get('gen_loss', 0.0)
-            disc_loss = avg_val_metrics.get('disc_loss', 0.0)
-            psnr = avg_val_metrics.get('psnr', 0.0)
-            ssim = avg_val_metrics.get('ssim', 0.0)
-            l1_loss = avg_val_metrics.get('l1_loss', 0.0)
-            l2_loss = avg_val_metrics.get('l2_loss', 0.0)
-            cycle_loss = avg_val_metrics.get('cycle_loss', 0.0)
-            lpips = avg_val_metrics.get('lpips', 0.0)
-            fid = avg_val_metrics.get('fid', 0.0)
-            feature_matching = avg_val_metrics.get('feature_matching_loss', 0.0)
-            print(f"│ Epoch {epoch + 1}/{start_epoch + epochs} (Validation) : gen_loss: {gen_loss:.4f} | disc_loss: {disc_loss:.4f} | cycle_loss: {cycle_loss:.4f} | psnr: {psnr:.4f} | ssim: {ssim:.4f} | l1_loss: {l1_loss:.4f} | l2_loss: {l2_loss:.4f} | feature_matching: {feature_matching:.4f} | lpips: {lpips:.4f} | FID: {fid:.4f}")          
-            print(f"\nTime taken for epoch {epoch + 1}: {time.time() - start:.2f} sec")
-           
-            # Generate visualizations every 5 epochs
-            if (epoch + 1) % 5 == 0 or epoch == start_epoch:
-                try:
-                    generate_and_save_visualizations(
-                        generator,
-                        val_vis_dataset,
-                        os.path.join(visualization_dir, f'epoch_{epoch+1}')
-                    )
-                    print(f"Saved visualizations for epoch {epoch+1}")
-                except Exception as vis_error:
-                    print(f"Error generating visualizations: {vis_error}")
-           
-            # Save comprehensive model checkpoint every epoch
-            try:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_data = {
-                    'epoch': epoch,
-                    'history': history
-                }
-                save_model_checkpoint(generator, discriminator, save_data, timestamp)
-                print(f"Saved checkpoint for epoch {epoch+1}")
-            except Exception as save_error:
-                print(f"Error saving checkpoint: {save_error}")
-   
-    return history
-
-def create_validation_subset(dataset, num_samples=5):
-    """Create a small validation dataset for visualization"""
-    val_dataset = dataset.take(num_samples).cache()
-    return val_dataset
-
-def generate_and_save_visualizations(generator, dataset, save_dir):
-    """Generate and save comparison visualizations"""
-    os.makedirs(save_dir, exist_ok=True)
-   
-    for i, (sar_batch, color_batch, terrain_batch) in enumerate(dataset):
-        # Generate images
-        generated_images = generator([sar_batch, terrain_batch], training=False)
-       
-        # Create figure with 3 columns (input, ground truth, generated)
-        plt.figure(figsize=(15, 5 * min(len(sar_batch), 3)))
-       
-        # Display up to 3 images from the batch
-        for j in range(min(len(sar_batch), 3)):
-            # Input SAR image
-            plt.subplot(min(len(sar_batch), 3), 3, j*3 + 1)
-            plt.title(f"Input SAR {j+1}")
-            plt.imshow(tf.cast(sar_batch[j] * 0.5 + 0.5, tf.float32).numpy())
-            plt.axis('off')
-           
-            # Ground truth color image
-            plt.subplot(min(len(sar_batch), 3), 3, j*3 + 2)
-            plt.title(f"Ground Truth {j+1}")
-            plt.imshow(tf.cast(color_batch[j] * 0.5 + 0.5, tf.float32).numpy())
-            plt.axis('off')
-           
-            # Generated color image
-            plt.subplot(min(len(sar_batch), 3), 3, j*3 + 3)
-            plt.title(f"Generated {j+1}")
-            plt.imshow(tf.cast(generated_images[j] * 0.5 + 0.5, tf.float32).numpy())
-            plt.axis('off')
-       
-        # Save the figure
-        plt.savefig(os.path.join(save_dir, f'comparison_{i+1}.png'), bbox_inches='tight')
-        plt.close()
-   
-    print(f"Saved {i+1} visualization images to {save_dir}")
-
-def calculate_detailed_metrics(sar_images, color_images, generated_images, cycle_reconstructed, terrain_labels):
-    """Calculate comprehensive metrics for model evaluation"""
-    # Initialize metrics dictionary
-    metrics = {}
-   
-    # Ensure all inputs are float32 for consistent calculation
-    sar_images = tf.cast(sar_images, tf.float32)
-    color_images = tf.cast(color_images, tf.float32)
-    generated_images = tf.cast(generated_images, tf.float32)
-    cycle_reconstructed = tf.cast(cycle_reconstructed, tf.float32)
-   
-    try:
-        metrics['l1_loss'] = tf.reduce_mean(tf.abs(color_images - generated_images)).numpy()
-        metrics['l2_loss'] = tf.reduce_mean(tf.square(color_images - generated_images)).numpy()
-        metrics['psnr'] = tf.image.psnr(color_images, generated_images, max_val=2.0).numpy().mean()
-        metrics['ssim'] = tf.image.ssim(color_images, generated_images, max_val=2.0).numpy().mean()
-        metrics['cycle_loss'] = tf.reduce_mean(tf.abs(sar_images - cycle_reconstructed)).numpy()
-        metrics['perceptual_loss'] = compute_perceptual_loss(color_images, generated_images).numpy()
-       
-        # Calculate LPIPS using the feature extractor
-        # LPIPS measures perceptual similarity using deep features
-        try:
-            # Preprocess images for feature extraction
-            real_images_processed = efficientnet.preprocess_input((color_images + 1) * 127.5)
-            generated_images_processed = efficientnet.preprocess_input((generated_images + 1) * 127.5)
-           
-            # Extract features
-            real_features = feature_extractor(real_images_processed)
-            gen_features = feature_extractor(generated_images_processed)
-           
-            # Calculate normalized distance between feature representations
-            lpips_value = 0.0
-            for rf, gf in zip(real_features, gen_features):
-                # Normalize features
-                rf_norm = tf.nn.l2_normalize(rf, axis=-1)
-                gf_norm = tf.nn.l2_normalize(gf, axis=-1)
-               
-                # Compute distance
-                lpips_value += tf.reduce_mean(tf.square(rf_norm - gf_norm))
-           
-            metrics['lpips'] = lpips_value.numpy() / len(real_features)
-        except Exception as e:
-            print(f"Error calculating LPIPS: {e}")
-            metrics['lpips'] = 0.0
-           
-        # Calculate feature matching loss
-        # This measures style similarity using discriminator features
-        try:
-            # We need the discriminator to extract features
-            # Since we can't directly access it here, we'll use a simplified approach
-            # using our feature extractor as a substitute
-           
-            # Extract mid-level features (these represent style information)
-            style_features_real = real_features[1]  # Using middle layer features
-            style_features_gen = gen_features[1]
-           
-            # Calculate mean and variance for each feature map (Gram matrix simplified)
-            real_mean = tf.reduce_mean(style_features_real, axis=[1, 2], keepdims=True)
-            gen_mean = tf.reduce_mean(style_features_gen, axis=[1, 2], keepdims=True)
-           
-            real_std = tf.math.reduce_std(style_features_real, axis=[1, 2], keepdims=True)
-            gen_std = tf.math.reduce_std(style_features_gen, axis=[1, 2], keepdims=True)
-           
-            # Feature matching loss combines differences in mean and standard deviation
-            mean_loss = tf.reduce_mean(tf.abs(real_mean - gen_mean))
-            std_loss = tf.reduce_mean(tf.abs(real_std - gen_std))
-           
-            metrics['feature_matching_loss'] = (mean_loss + std_loss).numpy()
-        except Exception as e:
-            print(f"Error calculating feature matching loss: {e}")
-            metrics['feature_matching_loss'] = 0.0
-       
-        # Calculate FID score
-        # This requires a sufficient batch size to be meaningful,
-        # so we'll only calculate it if we have enough images
-        try:
-            if color_images.shape[0] >= 8:  # Minimum batch size for meaningful FID
-                fid_score = calculate_fid_score(color_images, generated_images)
-                metrics['fid'] = fid_score.numpy()
-            else:
-                # For small batches, approximate FID using feature statistics
-                # from our existing feature extractor
-                real_feats_flat = tf.concat([tf.reshape(f, [tf.shape(f)[0], -1])
-                                           for f in real_features], axis=1)
-                gen_feats_flat = tf.concat([tf.reshape(f, [tf.shape(f)[0], -1])
-                                          for f in gen_features], axis=1)
-               
-                # Calculate mean and covariance
-                mu_real = tf.reduce_mean(real_feats_flat, axis=0)
-                mu_gen = tf.reduce_mean(gen_feats_flat, axis=0)
-               
-                # Use mean difference as simplified FID for small batches
-                metrics['fid'] = tf.reduce_mean(tf.square(mu_real - mu_gen)).numpy()
-        except Exception as e:
-            print(f"Error calculating FID score: {e}")
-            metrics['fid'] = 0.0
-           
-    except Exception as e:
-        print(f"Error in metrics: {e}")
-        metrics = {k: 0.0 for k in [
-            'l1_loss', 'l2_loss', 'psnr', 'ssim', 'cycle_loss',
-            'perceptual_loss', 'lpips', 'feature_matching_loss', 'fid'
-        ]}
-   
-    return metrics
-
-# Fix save_model_checkpoint function
-def save_model_checkpoint(generator, discriminator, save_data, timestamp):
-    """Improved model saving with consistent directory structure"""
-    # Create a fixed checkpoint directory to maintain consistency between runs
-    checkpoint_dir = '/kaggle/working/checkpoints'
-    os.makedirs(checkpoint_dir, exist_ok=True)
-   
-    # Create unique subdirectory based on timestamp and epoch
-    epoch = save_data['epoch']
-    checkpoint_subdir = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}_{timestamp}')
-    os.makedirs(checkpoint_subdir, exist_ok=True)
-   
-    try:
-        # Save model weights with explicit paths
-        gen_weights_path = os.path.join(checkpoint_subdir, 'generator.weights.h5')
-        disc_weights_path = os.path.join(checkpoint_subdir, 'discriminator.weights.h5')
-       
-        generator.save_weights(gen_weights_path)
-        discriminator.save_weights(disc_weights_path)
-       
-        # Verify weights were actually saved
-        if not os.path.exists(gen_weights_path) or not os.path.exists(disc_weights_path):
-            raise FileNotFoundError("Model weights were not saved properly")
-       
-        # Save model config separately for reliable loading
-        with open(os.path.join(checkpoint_subdir, 'generator_config.json'), 'w') as f:
-            json.dump(generator.get_config(), f)
-           
-        with open(os.path.join(checkpoint_subdir, 'discriminator_config.json'), 'w') as f:
-            json.dump(discriminator.get_config(), f)
-       
-        # Save optimizer states
-        if hasattr(generator, 'optimizer') and generator.optimizer:
-            gen_opt_state = extract_optimizer_state(generator.optimizer)
-            with open(os.path.join(checkpoint_subdir, 'generator_optimizer.json'), 'w') as f:
-                json.dump(gen_opt_state, f)
-       
-        if hasattr(discriminator, 'optimizer') and discriminator.optimizer:
-            disc_opt_state = extract_optimizer_state(discriminator.optimizer)
-            with open(os.path.join(checkpoint_subdir, 'discriminator_optimizer.json'), 'w') as f:
-                json.dump(disc_opt_state, f)
-       
-        # Save history separately
-        history_path = os.path.join(checkpoint_subdir, 'training_history.json')
-        with open(history_path, 'w') as f:
-            json.dump(save_data, f)
-       
-        # Update latest checkpoint pointer to point to the subdirectory
-        with open(os.path.join(checkpoint_dir, 'latest_checkpoint.txt'), 'w') as f:
-            f.write(checkpoint_subdir)
-       
-        print(f"Models successfully saved to {checkpoint_subdir}")
-        print(f"  - Generator weights: {os.path.getsize(gen_weights_path)/1024/1024:.2f} MB")
-        print(f"  - Discriminator weights: {os.path.getsize(disc_weights_path)/1024/1024:.2f} MB")
-       
-    except Exception as e:
-        print(f"ERROR: Failed to save checkpoint: {e}")
-        import traceback
-        traceback.print_exc()
-
-def load_latest_models():
-    """Enhanced model loading with comprehensive error handling"""
-    checkpoint_dir = '/kaggle/working/checkpoints'
-    latest_file = os.path.join(checkpoint_dir, 'latest_checkpoint.txt')
-   
-    if not os.path.exists(checkpoint_dir):
-        print("No checkpoint directory found. Will start fresh.")
-        return None, None, {}
-   
-    if not os.path.exists(latest_file):
-        print("No checkpoint tracking file found. Will start fresh.")
-        return None, None, {}
-   
-    # Define custom objects for model loading
-    custom_objects = {
-        "InstanceNormalization": InstanceNormalization,
-        "OptimizedColorTransformation": OptimizedColorTransformation,
-        "LightweightBoundaryDetection": LightweightBoundaryDetection,
-        "EfficientSkipConnection": EfficientSkipConnection,
-        "TerrainGuidedAttention": TerrainGuidedAttention,
-        "TerrainAdaptiveNormalization": TerrainAdaptiveNormalization,
-        "TerrainAwareResBlock": TerrainAwareResBlock,
-        "ColorRefinementBlock": ColorRefinementBlock,
-        "MemoryEfficientResBlock": MemoryEfficientResBlock,
-        "SiLUActivation": SiLUActivation,
-        "TileLayer": TileLayer,
-        "TerrainSpatialLayer": TerrainSpatialLayer
-    }
-   
-    try:
-        # Read the checkpoint directory path
-        with open(latest_file, 'r') as f:
-            checkpoint_path = f.read().strip()
-       
-        if not os.path.exists(checkpoint_path):
-            print(f"Checkpoint directory {checkpoint_path} does not exist. Will start fresh.")
-            return None, None, {}
-       
-        # Check for weights files with clear logging
-        gen_weights_path = os.path.join(checkpoint_path, 'generator.weights.h5')
-        disc_weights_path = os.path.join(checkpoint_path, 'discriminator.weights.h5')
-       
-        if not os.path.exists(gen_weights_path):
-            print(f"ERROR: Generator weights file not found at {gen_weights_path}")
-            return None, None, {}
-           
-        if not os.path.exists(disc_weights_path):
-            print(f"ERROR: Discriminator weights file not found at {disc_weights_path}")
-            return None, None, {}
-       
-        print(f"Found model weights files:")
-        print(f"  - Generator weights: {os.path.getsize(gen_weights_path)/1024/1024:.2f} MB")
-        print(f"  - Discriminator weights: {os.path.getsize(disc_weights_path)/1024/1024:.2f} MB")
-       
-        # Always recreate models from scratch for consistency
+        # Create the models
         generator = build_terrain_aware_generator()
         discriminator = build_terrain_aware_discriminator()
-       
-        # Force model to build by passing dummy inputs
-        dummy_sar = tf.zeros((1, IMG_HEIGHT, IMG_WIDTH, 3), dtype=tf.float32)
-        dummy_terrain = tf.zeros((1, len(TERRAIN_TYPES)), dtype=tf.float32)
-        dummy_color = tf.zeros((1, IMG_HEIGHT, IMG_WIDTH, 3), dtype=tf.float32)
-       
-        # Build the models with dummy forward passes
-        _ = generator([dummy_sar, dummy_terrain], training=False)
-        _ = discriminator([dummy_sar, dummy_color, dummy_terrain], training=False)
-       
-        # Then load weights with explicit try-except
-        try:
-            generator.load_weights(gen_weights_path)
-            discriminator.load_weights(disc_weights_path)
-            print("Successfully loaded model weights")
-        except Exception as weight_error:
-            print(f"ERROR loading weights: {weight_error}")
-            import traceback
-            traceback.print_exc()
-            return None, None, {}
-       
-        # Create fresh optimizers
-        gen_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5, clipnorm=1.0)
-        disc_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5, clipnorm=1.0)
-       
-        # Compile models with the fresh optimizers
-        generator.compile(optimizer=gen_optimizer)
-        discriminator.compile(optimizer=disc_optimizer)
-       
-        # Load optimizer states if they exist
-        gen_opt_path = os.path.join(checkpoint_path, 'generator_optimizer.json')
-        disc_opt_path = os.path.join(checkpoint_path, 'discriminator_optimizer.json')
-       
-        if os.path.exists(gen_opt_path):
+        
+        # Create optimizers
+        generator_optimizer = tf.keras.optimizers.Adam(
+            LEARNING_RATE, beta_1=BETA_1, beta_2=BETA_2
+        )
+        discriminator_optimizer = tf.keras.optimizers.Adam(
+            LEARNING_RATE, beta_1=BETA_1, beta_2=BETA_2
+        )
+        
+        # Initialize gradient accumulators (for gradient accumulation)
+        gen_gradient_accumulators = [
+            tf.Variable(tf.zeros_like(var), trainable=False)
+            for var in generator.trainable_variables
+        ]
+        disc_gradient_accumulators = [
+            tf.Variable(tf.zeros_like(var), trainable=False)
+            for var in discriminator.trainable_variables
+        ]
+        
+        # Initialize starting epoch and history
+        start_epoch = 0
+        history = get_initial_history()
+        
+        # Load saved model if resuming training
+        if resume_training:
             try:
-                with open(gen_opt_path, 'r') as f:
-                    gen_opt_state = json.load(f)
-                    generator.optimizer = restore_optimizer_state(generator.optimizer, gen_opt_state)
-                    print("Restored generator optimizer state")
-            except Exception as opt_error:
-                print(f"Warning: Could not restore generator optimizer: {opt_error}")
-       
-        if os.path.exists(disc_opt_path):
-            try:
-                with open(disc_opt_path, 'r') as f:
-                    disc_opt_state = json.load(f)
-                    discriminator.optimizer = restore_optimizer_state(discriminator.optimizer, disc_opt_state)
-                    print("Restored discriminator optimizer state")
-            except Exception as opt_error:
-                print(f"Warning: Could not restore discriminator optimizer: {opt_error}")
-       
-        # Load training history
-        history_path = os.path.join(checkpoint_path, 'training_history.json')
-        if os.path.exists(history_path):
-            with open(history_path, 'r') as f:
-                save_data = json.load(f)
-            print(f"Successfully loaded checkpoint from {os.path.basename(checkpoint_path)}")
-            print(f"Resuming from epoch {save_data.get('epoch', 0) + 1}")
-            return generator, discriminator, save_data
-        else:
-            print("No training history found, using default history")
-            return generator, discriminator, {'epoch': 0, 'history': get_initial_history()}
-   
-    except Exception as e:
-        print(f"Error loading models: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, {}
+                latest_checkpoint = tf.train.latest_checkpoint(model_dir)
+                if latest_checkpoint:
+                    # Load weights
+                    generator.load_weights(os.path.join(model_dir, 'generator_latest'))
+                    discriminator.load_weights(os.path.join(model_dir, 'discriminator_latest'))
+                    
+                    # Try to load training state
+                    with open(os.path.join(model_dir, 'train_state.json'), 'r') as f:
+                        train_state = json.load(f)
+                    start_epoch = train_state.get('epoch', 0)
+                    history = train_state.get('history', history)
+                    print(f"Resuming training from epoch {start_epoch}")
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}")
 
-def plot_training_history(history, save_path='/kaggle/working/training_curves'):
-    """Enhanced plot function with more comparisons between train and validation metrics"""
-    os.makedirs(save_path, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-   
-    # Plot train vs validation metrics for direct comparison
-    comparison_metrics = [
-        ('gen_loss', 'val_gen_loss', 'Generator Loss'),
-        ('disc_loss', 'val_disc_loss', 'Discriminator Loss'),
-        ('psnr', 'val_psnr', 'PSNR'),
-        ('ssim', 'val_ssim', 'SSIM'),
-        ('l1_loss', 'val_l1_loss', 'L1 Loss'),
-        ('l2_loss', 'val_l2_loss', 'L2 Loss'),
-        ('perceptual_loss', 'val_perceptual_loss', 'Perceptual Loss'),
-        ('style_loss', 'val_style_loss', 'Style Loss'),
-        ('feature_matching_loss', 'val_feature_matching_loss', 'Feature Matching Loss'),
-        ('cycle_loss', 'val_cycle_loss', 'Cycle Consistency Loss'),
-        ('lpips', 'val_lpips', 'LPIPS')
-    ]
-   
-    for train_key, val_key, title in comparison_metrics:
-        if train_key in history and val_key in history and len(history[train_key]) > 0 and len(history[val_key]) > 0:
-            plt.figure(figsize=(10, 6))
-            plt.plot(history[train_key], label=f'Training {title}')
-            plt.plot(history[val_key], label=f'Validation {title}')
-            plt.title(f'Training vs Validation {title}')
-            plt.xlabel('Epoch')
-            plt.ylabel('Value')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            plt.savefig(os.path.join(save_path, f'{train_key}_vs_{val_key}_{timestamp}.png'))
-            plt.close()
-   
-    # Group related metrics
-    metric_groups = {
-        'losses': ['gen_loss', 'disc_loss', 'val_gen_loss', 'val_disc_loss'],
-        'image_quality': ['psnr', 'ssim', 'val_psnr', 'val_ssim'],
-        'content_losses': ['l1_loss', 'l2_loss', 'perceptual_loss', 'val_l1_loss', 'val_l2_loss', 'val_perceptual_loss'],
-        'style_losses': ['style_loss', 'feature_matching_loss', 'val_style_loss', 'val_feature_matching_loss'],
-        'cycle_lpips': ['cycle_loss', 'lpips', 'val_cycle_loss', 'val_lpips']
-    }
-   
-    # Plot each metric group
-    for group_name, metrics in metric_groups.items():
-        valid_metrics = [m for m in metrics if m in history and len(history[m]) > 0]
-       
-        if not valid_metrics:
-            continue
-       
-        plt.figure(figsize=(12, 7))
-        for metric in valid_metrics:
-            plt.plot(history[metric], label=metric)
-       
-        plt.title(f'{group_name.replace("_", " ").title()}')
-        plt.xlabel('Epoch')
-        plt.ylabel('Value')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-       
-        # Save the plot
-        plt.savefig(os.path.join(save_path, f'{group_name}_{timestamp}.png'))
+        def reset_gradients():
+            """Reset accumulated gradients"""
+            for accumulator in gen_gradient_accumulators:
+                accumulator.assign(tf.zeros_like(accumulator))
+            for accumulator in disc_gradient_accumulators:
+                accumulator.assign(tf.zeros_like(accumulator))
+
+        # Modified apply_grads function to work within strategy's scope
+        @tf.function
+        def apply_accumulated_gradients():
+            """Apply accumulated gradients within the distribution strategy scope"""
+            def _apply_gradients_fn():
+                # Clip accumulated gradients
+                gen_grads_clipped = [
+                    tf.clip_by_norm(g, 1.0) for g in gen_gradient_accumulators
+                ]
+                disc_grads_clipped = [
+                    tf.clip_by_norm(g, 1.0) for g in disc_gradient_accumulators
+                ]
+                
+                # Apply gradients with explicit variable references
+                generator_optimizer.apply_gradients(
+                    [(g, v) for g, v in zip(gen_grads_clipped, generator.trainable_variables)]
+                )
+                discriminator_optimizer.apply_gradients(
+                    [(g, v) for g, v in zip(disc_grads_clipped, discriminator.trainable_variables)]
+                )
+                
+                # Reset gradients after applying
+                return True
+            
+            # Run the gradient application within strategy scope
+            return strategy.run(_apply_gradients_fn)
+    
+        # ...existing code for distributed_train_step, distributed_val_step, etc...
+    
+    # Training loop
+    for epoch in range(start_epoch, start_epoch + epochs):
+        # ...existing code for main training and validation loops...
+        pass
+        
+    # Save final model
+    generator.save_weights(os.path.join(model_dir, 'generator_final.h5'))
+    discriminator.save_weights(os.path.join(model_dir, 'discriminator_final'))
+    
+    # Save final training state
+    with open(os.path.join(model_dir, 'train_state_final.json'), 'w') as f:
+        json.dump({
+            'epoch': start_epoch + epochs - 1,
+            'history': history
+        }, f)
+    
+    return generator, discriminator, history
+
+def generate_and_save_visualizations(generator, dataset, output_dir):
+    """Generate and save visualization images"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for i, batch in enumerate(dataset):
+        sar_images, color_images, terrain_labels = batch
+        
+        # Generate images
+        generated_images = generator([sar_images, terrain_labels], training=False)
+        
+        # Convert from [-1,1] to [0,1] for visualization
+        sar_display = (sar_images + 1) / 2
+        gen_display = (generated_images + 1) / 2
+        real_display = (color_images + 1) / 2
+        
+        # Create a figure with 3 images side by side
+        plt.figure(figsize=(15, 5))
+        
+        plt.subplot(1, 3, 1)
+        plt.title('SAR Input')
+        plt.imshow(sar_display[0].numpy())
+        plt.axis('off')
+        
+        plt.subplot(1, 3, 2)
+        plt.title('Generated')
+        plt.imshow(gen_display[0].numpy())
+        plt.axis('off')
+        
+        plt.subplot(1, 3, 3)
+        plt.title('Ground Truth')
+        plt.imshow(real_display[0].numpy())
+        plt.axis('off')
+        
+        # Save the figure
+        plt.savefig(os.path.join(output_dir, f'comparison_{i}.png'))
         plt.close()
-   
-    # Save all metrics to CSV for further analysis
-    import pandas as pd
-    metrics_df = pd.DataFrame(history)
-    metrics_df.to_csv(os.path.join(save_path, f'training_metrics_{timestamp}.csv'))
-   
-    print(f"Training history plots saved to {save_path}")
 
-def get_latest_metric(history_dict, metric_name, default=0.0):
-    """Safely get the latest metric value from history dictionary"""
-    try:
-        values = history_dict.get(metric_name, [default])
-        return values[-1] if values else default
-    except (IndexError, TypeError, AttributeError):
-        return default
+def save_model_checkpoint(generator, discriminator, save_data, timestamp):
+    """Save model checkpoints"""
+    # Define directories
+    checkpoint_dir = 'd:/SAR/models'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Save models with timestamp
+    generator.save_weights(os.path.join(checkpoint_dir, f'generator_{timestamp}'))
+    discriminator.save_weights(os.path.join(checkpoint_dir, f'discriminator_{timestamp}'))
+    
+    # Also save as latest
+    generator.save_weights(os.path.join(checkpoint_dir, 'generator_latest'))
+    discriminator.save_weights(os.path.join(checkpoint_dir, 'discriminator_latest'))
+    
+    # Save training state (epoch and history)
+    with open(os.path.join(checkpoint_dir, 'train_state.json'), 'w') as f:
+        json.dump(save_data, f)
+    
+    print(f"Saved checkpoint at {timestamp}")
 
-# Add this function to calculate FID score
-def calculate_fid_score(real_images, generated_images):
-    """
-    Calculate Fréchet Inception Distance between real and generated images
-    """
-    # Ensure inputs are in the right format for InceptionV3
-    real_images = tf.image.resize(real_images, [299, 299])
-    real_images = tf.clip_by_value((real_images + 1.0) / 2.0, 0.0, 1.0) * 255.0
-   
-    generated_images = tf.image.resize(generated_images, [299, 299])
-    generated_images = tf.clip_by_value((generated_images + 1.0) / 2.0, 0.0, 1.0) * 255.0
-   
-    # Create inception model for feature extraction if it doesn't already exist
-    inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(299, 299, 3))
-   
-    # Extract features
-    real_features = inception_model(real_images, training=False)
-    gen_features = inception_model(generated_images, training=False)
-   
-    # Calculate mean and covariance statistics
-    mu_real = tf.reduce_mean(real_features, axis=0)
-    sigma_real = tfp.stats.covariance(real_features)
-   
-    mu_gen = tf.reduce_mean(gen_features, axis=0)
-    sigma_gen = tfp.stats.covariance(gen_features)
-   
-    # Calculate squared difference between means
-    mean_diff_squared = tf.reduce_sum(tf.square(mu_real - mu_gen))
-   
-    # Calculate square root of product of covariances
-    # Note: To avoid numerical issues, we use the scipy implementation
-    covmean = sqrtm(tf.matmul(sigma_real, sigma_gen))
-   
-    # Check if result contains complex numbers
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-   
-    # Calculate FID score
-    trace_covmean = tf.linalg.trace(covmean)
-    trace_real = tf.linalg.trace(sigma_real)
-    trace_gen = tf.linalg.trace(sigma_gen)
-   
-    fid = mean_diff_squared + trace_real + trace_gen - 2 * trace_covmean
-   
-    return fid
-
-# Add these utility functions for handling optimizer states
-def extract_optimizer_state(optimizer):
-    """Extract optimizer variables into a serializable dictionary"""
-    optimizer_vars = {}
-   
-    # Use optimizer.get_weights() if available (safer than iterating variables)
-    try:
-        # Extract iteration directly from optimizer's private internal state
-        # (This is version-specific but works in TF 2.17.1)
-        optimizer_vars['iteration'] = optimizer.iterations.numpy().item()
-       
-        # Collect all weights as flat arrays for consistent serialization
-        weight_values = optimizer.get_weights()
-        weight_names = [w.name for w in optimizer.weights]
-        optimizer_vars['weights'] = [(name, val.tolist()) for name, val in zip(weight_names, weight_values)]
-       
-        # Store hyperparameters that might be needed for reconstruction
-        optimizer_vars['learning_rate'] = float(optimizer.lr.numpy()) if hasattr(optimizer, 'lr') else 0.001
-        optimizer_vars['beta_1'] = float(optimizer.beta_1.numpy()) if hasattr(optimizer, 'beta_1') else 0.9
-        optimizer_vars['beta_2'] = float(optimizer.beta_2.numpy()) if hasattr(optimizer, 'beta_2') else 0.999
-        optimizer_vars['epsilon'] = float(optimizer.epsilon) if hasattr(optimizer, 'epsilon') else 1e-7
-       
-        return optimizer_vars
-    except Exception as e:
-        print(f"Error extracting optimizer state: {e}")
-        return {"error": str(e)}
-
-def restore_optimizer_state(optimizer, optimizer_state):
-    """Restore optimizer state from dictionary"""
-    if "error" in optimizer_state:
-        print(f"Cannot restore optimizer state: {optimizer_state['error']}")
-        return optimizer
-   
-    try:
-        # Set iteration
-        if 'iteration' in optimizer_state:
-            optimizer.iterations.assign(optimizer_state['iteration'])
-       
-        # Re-create weights if the structure matches
-        if 'weights' in optimizer_state:
-            # Convert back to numpy arrays from lists
-            weights_data = [(name, np.array(val)) for name, val in optimizer_state['weights']]
-           
-            # Make sure the weight count matches what's expected
-            if len(weights_data) == len(optimizer.weights):
-                # Sort both lists by name to ensure correct assignment
-                opt_weights = sorted(optimizer.weights, key=lambda x: x.name)
-                saved_weights = sorted(weights_data, key=lambda x: x[0])
-               
-                # Assign values to weights
-                for (_, saved_val), opt_weight in zip(saved_weights, opt_weights):
-                    # Ensure shapes match
-                    if saved_val.shape == opt_weight.shape:
-                        opt_weight.assign(saved_val)
-                    else:
-                        print(f"Shape mismatch: {opt_weight.name} - {opt_weight.shape} vs {saved_val.shape}")
-            else:
-                print(f"Weight count mismatch: {len(weights_data)} saved vs {len(optimizer.weights)} current")
-       
-        return optimizer
-    except Exception as e:
-        print(f"Error restoring optimizer state: {e}")
-        return optimizer
+# Main function that runs the training and evaluation
+if __name__ == '__main__':
+    # Import garbage collector for better memory management
+    import gc
+    
+    with strategy.scope():
+        # Get datasets
+        train_dataset, val_dataset, test_dataset = create_dataset()
+        
+        # Train the model with proper metrics tracking
+        generator, discriminator, history = train(train_dataset, val_dataset, epochs=200, resume_training=True)
+        
+        # Evaluate on test set
+        test_metrics = defaultdict(list)
+        for test_batch in test_dataset:
+            sar_batch, color_batch, terrain_batch = test_batch
+            generated_images = generator([sar_batch, terrain_batch], training=False)
+            cycle_reconstructed = generator([generated_images, terrain_batch], training=False)
+            detailed_metrics = calculate_detailed_metrics(
+                sar_batch, color_batch, generated_images, cycle_reconstructed, terrain_batch
+            )
+            for k, v in detailed_metrics.items():
+                test_metrics[k].append(v)
+                
+        print("Test Metrics:", {k: np.mean(v) for k, v in test_metrics.items()})
 
 # Add this utility function to reset optimizer state if needed (fixing NaN issues)
 def reset_optimizer_state(optimizer):
@@ -2352,56 +1890,5 @@ def reset_optimizer_state(optimizer):
         print(f"Error resetting optimizer: {e}")
         return optimizer
 
-# Modify the handle_training_issues function to use reset_optimizer_state
-def handle_training_issues(generator_optimizer, discriminator_optimizer):
-    """Check for and fix optimizer issues"""
-    try:
-        nan_detected = False
-       
-        # Check generator optimizer for NaN
-        for var in generator_optimizer.weights:
-            if tf.reduce_any(tf.math.is_nan(var)):
-                nan_detected = True
-                break
-       
-        if nan_detected:
-            print("Detected NaN in generator optimizer, resetting...")
-            generator_optimizer = reset_optimizer_state(generator_optimizer)
-       
-        # Reset nan_detected flag
-        nan_detected = False
-       
-        # Check discriminator optimizer for NaN
-        for var in discriminator_optimizer.weights:
-            if tf.reduce_any(tf.math.is_nan(var)):
-                nan_detected = True
-                break
-       
-        if nan_detected:
-            print("Detected NaN in discriminator optimizer, resetting...")
-            discriminator_optimizer = reset_optimizer_state(discriminator_optimizer)
-       
-        return generator_optimizer, discriminator_optimizer
-    except Exception as e:
-        print(f"Error handling training issues: {e}")
-        return generator_optimizer, discriminator_optimizer
+ 
 
-#main function
-   
-if __name__  == '__main__':
-    with strategy.scope():
-        # Get train, validation and test datasets
-        train_dataset, val_dataset, test_dataset = create_dataset()
-       
-        # Train the model
-        generator, discriminator, history = train(train_dataset, val_dataset, epochs=200, resume_training=True)
-       
-        test_metrics = defaultdict(list)
-        for test_batch in test_dataset:
-            sar_batch, color_batch, terrain_batch = test_batch
-            generated_images = generator([sar_batch, terrain_batch], training=False)
-            cycle_reconstructed = generator([generated_images, terrain_batch], training=False)
-            detailed_metrics = calculate_detailed_metrics(sar_batch, color_batch, generated_images, cycle_reconstructed, terrain_batch)
-            for k, v in detailed_metrics.items():
-                test_metrics[k].append(v)
-        print("Test Metrics:", {k: np.mean(v) for k, v in test_metrics.items()})

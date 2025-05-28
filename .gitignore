@@ -25,3 +25,9 @@ output_updatedSAR/
 .1/
 _1/
 __pycache__/
+checkpoints/
+samples/
+best_discriminator.pth
+best_generator.pth
+optimization_checkpoint_1 (2).pkl
+SAR_Literature_Review.xlsx
