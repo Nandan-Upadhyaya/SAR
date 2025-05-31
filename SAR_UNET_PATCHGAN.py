@@ -30,6 +30,7 @@ LAMBDA_FM = 10
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 TERRAIN_TYPES = ['urban', 'grassland', 'agri', 'barrenland']
 DATASET_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Dataset')  # Make path absolute
+TERRAIN_CLASSIFIER_PATH = 'terrain_classifier_checkpoints/best_terrain_classifier.pth'
 
 # Print dataset info ONCE
 if __name__ == '__main__':
@@ -331,22 +332,85 @@ def compute_metrics(loader, netG, device, inception_model_logits, inception_mode
     is_mean, is_std = compute_is(is_logits)
     return np.mean(psnr_list), np.mean(ssim_list), is_mean, fid
 
+# ------------------- TERRAIN CLASSIFIER MODEL -------------------
+class TerrainClassifier(nn.Module):
+    def __init__(self, num_classes=len(TERRAIN_TYPES)):
+        super().__init__()
+        self.backbone = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
+        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
+        self.dropout = nn.Dropout(0.4)
+    def forward(self, x):
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+        x = self.backbone.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.backbone.fc(x)
+        return x
+
+def load_terrain_classifier():
+    model = TerrainClassifier().to(DEVICE)
+    model.load_state_dict(torch.load(TERRAIN_CLASSIFIER_PATH, map_location=DEVICE))
+    model.eval()
+    return model
+
+def predict_terrain(model, sar_input):
+    """
+    Predict terrain class from SAR image and convert to one-hot encoded tensor
+    """
+    with torch.no_grad():
+        logits = model(sar_input)
+        pred_class = torch.argmax(logits, dim=1)
+        # Convert to one-hot encoded terrain vector
+        terrain_onehot = torch.zeros(pred_class.size(0), len(TERRAIN_TYPES), device=DEVICE)
+        for i, pred in enumerate(pred_class):
+            terrain_onehot[i, pred] = 1.0
+    return terrain_onehot
+
 # ------------------- TRAINING -------------------
 def train():
     train_loader, val_loader, test_loader = get_loaders(DATASET_ROOT, BATCH_SIZE)
     netG = Generator().to(DEVICE)
     netD = Discriminator().to(DEVICE)
+    
+    # Load terrain classifier model for predicting terrain classes
+    terrain_classifier = load_terrain_classifier()
+    
     perceptual_loss = PerceptualLoss().to(DEVICE)
-    optG = Adam(netG.parameters(), lr=LR, betas=(0.5, 0.999))
-    optD = Adam(netD.parameters(), lr=LR, betas=(0.5, 0.999))
+    
+    # Use more conservative learning rates to stabilize training
+    optG = Adam(netG.parameters(), lr=LR/2, betas=(0.5, 0.999))
+    optD = Adam(netD.parameters(), lr=LR/5, betas=(0.5, 0.999))
+    
+    # Add learning rate schedulers for better stability
+    schedulerG = torch.optim.lr_scheduler.ReduceLROnPlateau(optG, mode='min', factor=0.5, patience=5, verbose=True)
+    schedulerD = torch.optim.lr_scheduler.ReduceLROnPlateau(optD, mode='min', factor=0.5, patience=5, verbose=True)
+    
     scaler = torch.amp.GradScaler()
     best_psnr = 0
+    start_epoch = 0
+    
+    # Gradient clipping value to control explosion of gradients
+    grad_clip_value = 0.5
 
-    # Inception model for IS/FID
+    # Create checkpoints and samples directories if not exist
+    checkpoints_dir = 'checkpoints'
+    samples_dir = 'samples'
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(samples_dir, exist_ok=True)
+    
+    # Initialize inception models for IS/FID calculations
     inception_model_logits = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False, aux_logits=True).to(DEVICE)
     inception_model_logits.eval()
     for p in inception_model_logits.parameters():
         p.requires_grad = False
+    
     inception_model_pool = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
     inception_model_pool.fc = nn.Identity()
     inception_model_pool.eval()
@@ -354,46 +418,82 @@ def train():
     for p in inception_model_pool.parameters():
         p.requires_grad = False
 
-    # Create checkpoints and samples directories if not exist
-    checkpoints_dir = 'checkpoints'
-    samples_dir = 'samples'
-    os.makedirs(checkpoints_dir, exist_ok=True)
-    os.makedirs(samples_dir, exist_ok=True)
+    # Optionally load from a checkpoint
+    checkpoint_path = os.path.join(checkpoints_dir, 'D:\SAR\checkpoints\checkpoint_epoch_106.pth')
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+        netG.load_state_dict(checkpoint['generator_state_dict'])
+        netD.load_state_dict(checkpoint['discriminator_state_dict'])
+        optG.load_state_dict(checkpoint['optimizerG_state_dict'])
+        optD.load_state_dict(checkpoint['optimizerD_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        best_psnr = checkpoint.get('best_psnr', 0)
+        start_epoch = checkpoint.get('epoch', 0)
+        print(f"Resuming from epoch {start_epoch}")
+    else:
+        print("No checkpoint found. Starting from scratch.")
 
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(start_epoch, NUM_EPOCHS):
         netG.train()
         netD.train()
         running_loss_G = 0.0
         running_loss_D = 0.0
-        for sar, color, terrain in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
-            sar, color, terrain = sar.to(DEVICE), color.to(DEVICE), terrain.to(DEVICE)
+        for sar, color, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
+            sar, color = sar.to(DEVICE), color.to(DEVICE)
+            
+            # Predict terrain using the classifier model
+            predicted_terrain = predict_terrain(terrain_classifier, sar)
+            
             # Train D
-            with autocast():
-                fake = netG(sar, terrain)
-                pred_real = netD(sar, color, terrain)
-                pred_fake = netD(sar, fake.detach(), terrain)
-                loss_D = (gan_loss(pred_real, True) + gan_loss(pred_fake, False)) * 0.5
+            with torch.amp.autocast('cuda'):
+                # Use predicted terrain instead of ground truth
+                fake = netG(sar, predicted_terrain)
+                pred_real = netD(sar, color, predicted_terrain)
+                pred_fake = netD(sar, fake.detach(), predicted_terrain)
+                loss_D_real = gan_loss(pred_real, True)
+                loss_D_fake = gan_loss(pred_fake, False)
+                loss_D = (loss_D_real + loss_D_fake) * 0.5
+                
             optD.zero_grad()
             scaler.scale(loss_D).backward()
+            # Apply gradient clipping to stabilize training
+            scaler.unscale_(optD)
+            torch.nn.utils.clip_grad_norm_(netD.parameters(), grad_clip_value)
             scaler.step(optD)
+            
             # Train G
-            with autocast():
-                fake = netG(sar, terrain)
-                pred_fake = netD(sar, fake, terrain)
+            with torch.amp.autocast('cuda'):
+                fake = netG(sar, predicted_terrain)
+                pred_fake = netD(sar, fake, predicted_terrain)
+                
                 loss_GAN = gan_loss(pred_fake, True)
                 loss_L1 = F.l1_loss(fake, color)
                 loss_perc = perceptual_loss(fake, color)
-                loss_G = loss_GAN + LAMBDA_L1 * loss_L1 + LAMBDA_PERCEPTUAL * loss_perc
+                
+                # Gradually reduce L1 weight as training progresses
+                current_lambda_L1 = LAMBDA_L1 * (0.9 ** (epoch // 10))
+                
+                loss_G = loss_GAN + current_lambda_L1 * loss_L1 + LAMBDA_PERCEPTUAL * loss_perc
+                
             optG.zero_grad()
             scaler.scale(loss_G).backward()
+            # Apply gradient clipping to stabilize training
+            scaler.unscale_(optG)
+            torch.nn.utils.clip_grad_norm_(netG.parameters(), grad_clip_value)
             scaler.step(optG)
             scaler.update()
-            # Accumulate losses for printing
+            
             running_loss_G += loss_G.item()
             running_loss_D += loss_D.item()
+            
         avg_loss_G = running_loss_G / len(train_loader)
         avg_loss_D = running_loss_D / len(train_loader)
         print(f"Epoch {epoch+1}: Generator Loss: {avg_loss_G:.4f} | Discriminator Loss: {avg_loss_D:.4f}")
+        
+        # Update learning rates based on losses
+        schedulerG.step(avg_loss_G)
+        schedulerD.step(avg_loss_D)
 
         # Compute metrics for train set
         netG.eval()
@@ -410,9 +510,11 @@ def train():
 
         # Save a sample SAR, GT, and generated image as a single jpg after every epoch
         with torch.no_grad():
-            sar, color, terrain = next(iter(val_loader))
-            sar, color, terrain = sar.to(DEVICE), color.to(DEVICE), terrain.to(DEVICE)
-            fake = netG(sar, terrain)
+            sar, color, _ = next(iter(val_loader))
+            sar, color = sar.to(DEVICE), color.to(DEVICE)
+            # Get predicted terrain for the sample
+            predicted_terrain = predict_terrain(terrain_classifier, sar)
+            fake = netG(sar, predicted_terrain)
             # Take first sample in batch
             sar_img = (sar[0] + 1) / 2
             color_img = (color[0] + 1) / 2
@@ -449,11 +551,21 @@ def test():
     netG = Generator().to(DEVICE)
     netG.load_state_dict(torch.load('best_generator.pth', map_location=DEVICE))
     netG.eval()
+    
+    # Load terrain classifier
+    terrain_classifier = load_terrain_classifier()
+    
     os.makedirs('test_results', exist_ok=True)
     with torch.no_grad():
-        for i, (sar, color, terrain) in enumerate(test_loader):
-            sar, color, terrain = sar.to(DEVICE), color.to(DEVICE), terrain.to(DEVICE)
-            fake = netG(sar, terrain)
+        for i, (sar, color, _) in enumerate(test_loader):
+            sar, color = sar.to(DEVICE), color.to(DEVICE)
+            
+            # Predict terrain using classifier
+            predicted_terrain = predict_terrain(terrain_classifier, sar)
+            
+            # Generate colorized image using predicted terrain
+            fake = netG(sar, predicted_terrain)
+            
             save_image((fake+1)/2, f'test_results/gen_{i:04d}.png')
             save_image((color+1)/2, f'test_results/gt_{i:04d}.png')
             save_image((sar+1)/2, f'test_results/sar_{i:04d}.png')
