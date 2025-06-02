@@ -8,10 +8,10 @@ The second column represents the ground truth images of all the input SAR Images
 
 ## 🛰️ Overview
 
-This project implements a deep learning system for translating Synthetic Aperture Radar (SAR) imagery into realistic RGB images. Using a conditional GAN architecture with terrain-specific optimization, the model can generate colorized versions of SAR data that closely resemble aerial/satellite photography.
+This project implements a deep learning system for translating Synthetic Aperture Radar (SAR) imagery into realistic RGB images. A pretrained ResNet34 Model is finetuned to classify different terrains for SAR Images. Integrating the ResNet34 Model with a conditional Generative Adversarial Network (GAN) architecture, the model can generate colorized versions of SAR data that closely resemble aerial/satellite photography.
 
 Classification accuracy achieved by the ResNet34 Model : **99.94%**
-### Key Metrics Achieved in validation set:
+### Key Metrics Achieved by the GAN Model in validation set:
 - **FID Score**: 108.18 
 - **SSIM**: 0.36
 - **PSNR**: 19 dB
