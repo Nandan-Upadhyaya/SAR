@@ -1,4 +1,4 @@
-# SAR-to-RGB: Terrain-Aware Image Translation
+# Terrain-Aware Synthetic Radar Image (SAR) to RGB Colorization through Automated Terrain Classification using Conditional Generative Adversarial Network (GAN)
 
 <p align="center">
   <img src="random_terrain_comparison.jpg" alt="SAR to RGB Translation Examples" width="800"/>
