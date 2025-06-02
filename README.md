@@ -10,10 +10,12 @@ The second column represents the ground truth images of all the input SAR Images
 
 This project implements a deep learning system for translating Synthetic Aperture Radar (SAR) imagery into realistic RGB images. Using a conditional GAN architecture with terrain-specific optimization, the model can generate colorized versions of SAR data that closely resemble aerial/satellite photography.
 
-### Key Metrics Achieved:
-- **FID Score**: 108.18 (Epoch 139)
-- **SSIM**: 0.41+
-- **PSNR**: ~21 dB
+### Key Metrics Achieved in validation set:
+- **FID Score**: 108.18 
+- **SSIM**: 0.36
+- **PSNR**: 19 dB
+- **IS** : 3.07
+
 
 ## 🔍 Features
 
