@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 
 # ------------------- CONFIG -------------------
 IMG_SIZE = 256
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 NUM_EPOCHS = 200
 LR = 2e-4
 LAMBDA_L1 = 100
@@ -378,39 +378,32 @@ def train():
     train_loader, val_loader, test_loader = get_loaders(DATASET_ROOT, BATCH_SIZE)
     netG = Generator().to(DEVICE)
     netD = Discriminator().to(DEVICE)
-    
-    # Load terrain classifier model for predicting terrain classes
     terrain_classifier = load_terrain_classifier()
-    
     perceptual_loss = PerceptualLoss().to(DEVICE)
-    
-    # Use more conservative learning rates to stabilize training
-    optG = Adam(netG.parameters(), lr=LR/2, betas=(0.5, 0.999))
-    optD = Adam(netD.parameters(), lr=LR/5, betas=(0.5, 0.999))
-    
-    # Add learning rate schedulers for better stability
-    schedulerG = torch.optim.lr_scheduler.ReduceLROnPlateau(optG, mode='min', factor=0.5, patience=5, verbose=True)
-    schedulerD = torch.optim.lr_scheduler.ReduceLROnPlateau(optD, mode='min', factor=0.5, patience=5, verbose=True)
-    
+
+    # Lower learning rates for more stable adversarial training with weight decay
+    optG = Adam(netG.parameters(), lr=LR/10, betas=(0.5, 0.999), weight_decay=5e-5)
+    optD = Adam(netD.parameters(), lr=LR/20, betas=(0.5, 0.999), weight_decay=5e-5)
+
+    # Increased patience for schedulers to allow more time to converge
+    schedulerG = torch.optim.lr_scheduler.ReduceLROnPlateau(optG, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-7)
+    schedulerD = torch.optim.lr_scheduler.ReduceLROnPlateau(optD, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-7)
+
     scaler = torch.amp.GradScaler()
-    best_psnr = 0
+    best_fid = float('inf')
     start_epoch = 0
-    
-    # Gradient clipping value to control explosion of gradients
     grad_clip_value = 0.5
 
-    # Create checkpoints and samples directories if not exist
     checkpoints_dir = 'checkpoints'
     samples_dir = 'samples'
     os.makedirs(checkpoints_dir, exist_ok=True)
     os.makedirs(samples_dir, exist_ok=True)
-    
-    # Initialize inception models for IS/FID calculations
+
     inception_model_logits = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False, aux_logits=True).to(DEVICE)
     inception_model_logits.eval()
     for p in inception_model_logits.parameters():
         p.requires_grad = False
-    
+
     inception_model_pool = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
     inception_model_pool.fc = nn.Identity()
     inception_model_pool.eval()
@@ -419,7 +412,7 @@ def train():
         p.requires_grad = False
 
     # Optionally load from a checkpoint
-    checkpoint_path = os.path.join(checkpoints_dir, 'D:\SAR\checkpoints\checkpoint_epoch_106.pth')
+    checkpoint_path = os.path.join(checkpoints_dir, 'D:\SAR\checkpoints\checkpoint_epoch_139.pth')
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
@@ -441,72 +434,73 @@ def train():
         running_loss_D = 0.0
         for sar, color, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             sar, color = sar.to(DEVICE), color.to(DEVICE)
-            
-            # Predict terrain using the classifier model
             predicted_terrain = predict_terrain(terrain_classifier, sar)
-            
-            # Train D
+
+            # Get PatchGAN output shape for label smoothing
+            with torch.no_grad():
+                fake_tmp = netG(sar, predicted_terrain)
+                pred_real_tmp = netD(sar, color, predicted_terrain)
+            label_shape = pred_real_tmp.shape
+
+            # Label smoothing for D (match PatchGAN output shape)
+            real_label = torch.ones(label_shape, device=DEVICE) * (0.9 + 0.1 * torch.rand(label_shape, device=DEVICE))
+            fake_label = torch.zeros(label_shape, device=DEVICE) + 0.1 * torch.rand(label_shape, device=DEVICE)
+
+            # Add one-sided label smoothing for generator (target 1.0, not 0.9)
+            gen_label = torch.ones(label_shape, device=DEVICE)
+
             with torch.amp.autocast('cuda'):
-                # Use predicted terrain instead of ground truth
                 fake = netG(sar, predicted_terrain)
                 pred_real = netD(sar, color, predicted_terrain)
                 pred_fake = netD(sar, fake.detach(), predicted_terrain)
-                loss_D_real = gan_loss(pred_real, True)
-                loss_D_fake = gan_loss(pred_fake, False)
+                loss_D_real = F.mse_loss(pred_real, real_label)
+                loss_D_fake = F.mse_loss(pred_fake, fake_label)
                 loss_D = (loss_D_real + loss_D_fake) * 0.5
-                
+
             optD.zero_grad()
             scaler.scale(loss_D).backward()
-            # Apply gradient clipping to stabilize training
             scaler.unscale_(optD)
             torch.nn.utils.clip_grad_norm_(netD.parameters(), grad_clip_value)
             scaler.step(optD)
-            
-            # Train G
+
             with torch.amp.autocast('cuda'):
                 fake = netG(sar, predicted_terrain)
                 pred_fake = netD(sar, fake, predicted_terrain)
-                
-                loss_GAN = gan_loss(pred_fake, True)
+                # Use gen_label (all 1s) for generator loss
+                loss_GAN = F.mse_loss(pred_fake, gen_label)
                 loss_L1 = F.l1_loss(fake, color)
                 loss_perc = perceptual_loss(fake, color)
-                
-                # Gradually reduce L1 weight as training progresses
-                current_lambda_L1 = LAMBDA_L1 * (0.9 ** (epoch // 10))
-                
-                loss_G = loss_GAN + current_lambda_L1 * loss_L1 + LAMBDA_PERCEPTUAL * loss_perc
-                
+                # Rebalance loss weights to focus on FID improvement
+                loss_G = loss_GAN + (LAMBDA_L1 * 0.6) * loss_L1 + (LAMBDA_PERCEPTUAL * 1.5) * loss_perc
+
             optG.zero_grad()
             scaler.scale(loss_G).backward()
-            # Apply gradient clipping to stabilize training
             scaler.unscale_(optG)
             torch.nn.utils.clip_grad_norm_(netG.parameters(), grad_clip_value)
             scaler.step(optG)
             scaler.update()
-            
+
             running_loss_G += loss_G.item()
             running_loss_D += loss_D.item()
-            
+
         avg_loss_G = running_loss_G / len(train_loader)
         avg_loss_D = running_loss_D / len(train_loader)
         print(f"Epoch {epoch+1}: Generator Loss: {avg_loss_G:.4f} | Discriminator Loss: {avg_loss_D:.4f}")
-        
-        # Update learning rates based on losses
-        schedulerG.step(avg_loss_G)
-        schedulerD.step(avg_loss_D)
 
-        # Compute metrics for train set
         netG.eval()
         print("Computing train metrics...")
         train_psnr, train_ssim, train_is, train_fid = compute_metrics(
             train_loader, netG, DEVICE, inception_model_logits, inception_model_pool)
         print(f"Train PSNR: {train_psnr:.2f} | SSIM: {train_ssim:.4f} | IS: {train_is:.2f} | FID: {train_fid:.2f}")
 
-        # Compute metrics for val set
         print("Computing val metrics...")
         val_psnr, val_ssim, val_is, val_fid = compute_metrics(
             val_loader, netG, DEVICE, inception_model_logits, inception_model_pool)
         print(f"Val PSNR: {val_psnr:.2f} | SSIM: {val_ssim:.4f} | IS: {val_is:.2f} | FID: {val_fid:.2f}")
+
+        # Use FID for scheduler step (lower is better)
+        schedulerG.step(val_fid)
+        schedulerD.step(val_fid)
 
         # Save a sample SAR, GT, and generated image as a single jpg after every epoch
         with torch.no_grad():
@@ -536,12 +530,12 @@ def train():
             'best_psnr': best_psnr
         }, os.path.join(checkpoints_dir, f'checkpoint_epoch_{epoch+1}.pth'))
 
-        # Validation PSNR for best model saving
-        if val_psnr > best_psnr:
-            best_psnr = val_psnr
+        # Save best model based on FID
+        if val_fid < best_fid:
+            best_fid = val_fid
             torch.save(netG.state_dict(), 'best_generator.pth')
             torch.save(netD.state_dict(), 'best_discriminator.pth')
-            print("Saved best model.")
+            print("Saved best model (lowest FID).")
 
     print("Training complete.")
 

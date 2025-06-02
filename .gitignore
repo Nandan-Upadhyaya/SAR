@@ -32,3 +32,5 @@ best_generator.pth
 optimization_checkpoint_1 (2).pkl
 SAR_Literature_Review.xlsx
 terrain_classifier_checkpoints/
+ROIs1868_summer_s1_59_p8_colorized_comparison.jpg
+random_terrain_comparison.jpg
