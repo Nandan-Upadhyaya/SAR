@@ -1,7 +1,7 @@
 # SAR-to-RGB: Terrain-Aware Image Translation
 
 <p align="center">
-  <img src="some_samples/random_terrain_comparison.jpg" alt="SAR to RGB Translation Examples" width="800"/>
+  <img src="random_terrain_comparison.jpg" alt="SAR to RGB Translation Examples" width="800"/>
 </p>
 
 ## 🛰️ Overview
