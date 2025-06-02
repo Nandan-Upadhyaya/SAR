@@ -14,17 +14,25 @@ This project implements a deep learning system for translating Synthetic Apertur
 - **PatchGAN Discriminator**: For high-quality local texture assessment
 - **Performance Metrics**: FID, SSIM, PSNR, and Inception Score (IS) evaluation
 
-## 🏗️ Architecture
-
-The system consists of three key components:
-
-1. **Terrain Classifier**: ResNet34-based model that identifies land cover type from SAR imagery
-2. **Generator**: UNet architecture conditioned on terrain features
-3. **Discriminator**: PatchGAN for realistic texture assessment
+## 🧠 Architecture
 
 <p align="center">
-  <img src="samples/architecture_diagram.png" alt="Architecture Diagram" width="700"/>
+  <img src="Arch.png" alt="Architecture Diagram" width="800"/>
 </p>
+
+
+The above figure depicts the architectural diagram that is used for the purpose.
+The model is built in two stages:
+
+1. Terrain Classification
+A ResNet34-based classifier takes in SAR images and predicts the terrain type (e.g., urban, grassland, agricultural, barrenland).
+
+The predicted terrain is converted into a one-hot encoded vector and passed through a small neural network to generate a terrain embedding.
+
+2. Terrain-Aware Colorization (UNet + PatchGAN)
+A UNet-based generator takes the SAR image and terrain embedding to generate a colorized version of the input.
+
+A PatchGAN discriminator evaluates the realism of the generated image, conditioned on both the SAR input and terrain type.
 
 ## 🏗️ Training Setup:
 - **Framework** : PyTorch
