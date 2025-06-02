@@ -1,4 +1,4 @@
-# Terrain-Aware Synthetic Radar Image (SAR) to RGB Colorization through Automated Terrain Classification using Conditional Generative Adversarial Network (GAN)
+# Terrain-Aware Synthetic Aperture Radar Image (SAR) to RGB Colorization through Automated Terrain Classification using Conditional Generative Adversarial Network (GAN)
 
 ## 🛰️ Overview
 
