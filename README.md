@@ -61,7 +61,7 @@ We evaluated our model using multiple metrics:
 - **IS** (Inception Score): Measures diversity and quality of generated samples
 
 Classification accuracy achieved by the ResNet34 Model : **99.94%**
-### Key Metrics Achieved by the GAN Model in validation set:
+### Key Metrics Achieved by the GAN Model:
 - **FID Score**: 108.18 
 - **SSIM**: 0.36
 - **PSNR**: 19 dB
