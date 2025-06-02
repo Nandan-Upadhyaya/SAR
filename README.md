@@ -73,7 +73,7 @@ Run the inference script with your SAR image
 
 The script will:
 1. Prompt you for a SAR image path
-2. Once the SAR Image is received, i's terrain will be classified by the ResNet34 Model.
+2. Once the SAR Image is received, it's terrain will be classified by the ResNet34 Model.
 3. The Unet based  Generator will receive the terrain class and based on the terrain it will generate a colorized version
 4. Display and save the results
 
