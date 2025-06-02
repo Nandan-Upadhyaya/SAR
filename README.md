@@ -34,6 +34,10 @@ The system consists of three key components:
 - **Learning Rate** : 2e-4
 - **Mixed Precision** : Enabled
 
+## 🏗️ Dataset:
+The dataset consisted of 4 terrains namely, urban, grassland, barrenland and agri. Each terrain had 2 different folders, one for the SAR Images and the other included the Corresponding color images of it.
+The dataset was split in a 80/20 manner during training.
+
 ## 🚀 Getting Started
 
 ### Requirements
