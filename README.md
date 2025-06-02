@@ -32,7 +32,22 @@ The system consists of three key components:
 - **Epochs** : 140
 - **Batch Size** : 8
 - **Learning Rate** : 2e-4
-- **Mixed Precision** : Enabled 
+- **Mixed Precision** : Enabled
+
+## 🚀 Getting Started
+
+### Requirements
+
+```
+torch>=1.8.0
+torchvision>=0.9.0
+numpy
+matplotlib
+Pillow
+tqdm
+scikit-image
+```
+
   
 
 
@@ -64,57 +79,14 @@ The second column represents the ground truth images of all the input SAR Images
 </p>
 SAR Input Image provided by the user and the corresponding output colorized image provided by our model.
 
-## 🚀 Getting Started
-
-### Requirements
-
-```
-torch>=1.8.0
-torchvision>=0.9.0
-numpy
-matplotlib
-Pillow
-tqdm
-scikit-image
-```
-
-
-
-## 💻 Usage
-
-### Testing with Your Own Images
-
-Run the inference script with your SAR image
-
-The script will:
-1. Prompt you for a SAR image path
-2. Once the SAR Image is received, it's terrain will be classified by the ResNet34 Model.
-3. The Unet based  Generator will receive the terrain class and based on the terrain it will generate a colorized version
-4. Display and save the results
 
 
 
 
 
-## 📁 Dataset Organization
 
-The dataset should be organized as follows:
 
-```
-Dataset/
-├── urban/
-│   ├── SAR/
-│   └── Color/
-├── grassland/
-│   ├── SAR/
-│   └── Color/
-├── agri/
-│   ├── SAR/
-│   └── Color/
-└── barrenland/
-    ├── SAR/
-    └── Color/
-```
+
 
 
 
