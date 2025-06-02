@@ -26,9 +26,24 @@ The system consists of three key components:
   <img src="samples/architecture_diagram.png" alt="Architecture Diagram" width="700"/>
 </p>
 
+## 🏗️ Training Setup:
+- **Framework** : PyTorch
+- **GPU** : NVIDIA Geforce RTX 4060
+- **Epochs** : 140
+- **Batch Size** : 8
+- **Learning Rate** : 2e-4
+- **Mixed Precision** : Enabled 
+  
+
+
 ## 📊 Results
 
 Our model achieves state-of-the-art results in SAR-to-RGB conversion across multiple terrain types. By conditioning on terrain classification, the model produces more accurate and visually coherent colorized images than terrain-agnostic approaches.
+We evaluated our model using multiple metrics:
+- **FID** (Fréchet Inception Distance): Measures similarity between generated and real images
+- **SSIM** (Structural Similarity Index): Evaluates structural preservation
+- **PSNR** (Peak Signal-to-Noise Ratio): Assesses pixel-level reconstruction quality
+- **IS** (Inception Score): Measures diversity and quality of generated samples
 
 Classification accuracy achieved by the ResNet34 Model : **99.94%**
 ### Key Metrics Achieved by the GAN Model in validation set:
@@ -101,13 +116,9 @@ Dataset/
     └── Color/
 ```
 
-## 📈 Performance Analysis
 
-We evaluated our model using multiple metrics:
-- **FID** (Fréchet Inception Distance): Measures similarity between generated and real images
-- **SSIM** (Structural Similarity Index): Evaluates structural preservation
-- **PSNR** (Peak Signal-to-Noise Ratio): Assesses pixel-level reconstruction quality
-- **IS** (Inception Score): Measures diversity and quality of generated samples
+
+
 
 
 
