@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SAR Image Colorization</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body, html {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            background-image: url('/static/images/background.jpg');
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+            background-repeat: no-repeat;
+        }
+        
+        /* Dark overlay for better text readability */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            z-index: -1;
+        }
+        
+        .main-container {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .content-wrapper {
+            width: 100%;
+            max-width: 900px;
+            text-align: center;
+        }
+        
+        .preview-container {
+            max-width: 800px;
+            margin: 30px auto;
+        }
+        
+        .preview-image {
+            width: 100%;
+            height: auto;
+            max-height: 70vh;
+            object-fit: contain;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+        }
+        
+        #loading {
+            display: none;
+            text-align: center;
+            margin: 20px 0;
+        }
+        
+        .result-container {
+            display: none;
+            margin-top: 30px;
+        }
+        
+        .terrain-info {
+            margin: 20px 0;
+        }
+        
+        .download-buttons {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        @media (max-width: 576px) {
+            .download-buttons {
+                flex-direction: column;
+                align-items: center;
+            }
+            .download-buttons .btn {
+                width: 200px;
+                margin-bottom: 10px;
+            }
+        }
+        
+        .card {
+            border: none;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="main-container">
+        <div class="content-wrapper">
+            <h1 class="mb-5" style="font-size: 3.5rem; font-weight: 300; color: white; text-shadow: 2px 2px 8px rgba(0,0,0,0.8);">SAR Image Colorization</h1>
+            
+            <div class="card" style="padding: 30px; background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.2);">
+                <div class="card-body">
+                    <form id="uploadForm">
+                        <div class="mb-4">
+                            <label for="imageInput" class="form-label" style="font-size: 1.3rem; margin-bottom: 15px; color: #333;">Select SAR Image</label>
+                            <input type="file" class="form-control" id="imageInput" accept="image/*" required style="font-size: 1.1rem; padding: 15px; border-radius: 8px; border: 2px solid #ddd;">
+                        </div>
+                        <button type="submit" class="btn btn-primary w-100" style="font-size: 1.3rem; padding: 18px; border-radius: 8px; font-weight: 500; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none;">Colorize Image</button>
+                    </form>
+                </div>
+            </div>
+
+            <div id="loading" style="margin: 40px 0;">
+                <div class="spinner-border" role="status" style="width: 4rem; height: 4rem; color: #667eea;">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+                <p class="mt-3" style="font-size: 1.2rem; color: white; text-shadow: 1px 1px 4px rgba(0,0,0,0.8);">Processing image...</p>
+            </div>
+
+            <div class="result-container" id="resultContainer">
+                <h4 class="mb-5" style="font-size: 2.2rem; font-weight: 300; color: white; text-shadow: 2px 2px 8px rgba(0,0,0,0.8);">Results Comparison</h4>
+                <div class="preview-container">
+                    <img id="comparisonImage" class="preview-image" src="" alt="Comparison view">
+                </div>
+                
+                <div class="terrain-info" style="margin: 30px 0;">
+                    <p class="mb-0" style="font-size: 1.3rem; color: white; text-shadow: 1px 1px 4px rgba(0,0,0,0.8);">Detected Terrain Type: <span id="terrainType" class="badge" style="font-size: 1.1rem; padding: 10px 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;"></span></p>
+                </div>
+                
+                <div class="download-buttons">
+                    <a id="downloadResult" href="" class="btn" download="colorized.png" style="font-size: 1.1rem; padding: 15px 30px; border-radius: 8px; margin: 8px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-decoration: none; border: none; box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);">
+                        Download Colorized Image
+                    </a>
+                    <a id="downloadComparison" href="" class="btn" download="comparison.jpg" style="font-size: 1.1rem; padding: 15px 30px; border-radius: 8px; margin: 8px; background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); color: white; text-decoration: none; border: none; box-shadow: 0 4px 15px rgba(17, 153, 142, 0.4);">
+                        Download Comparison
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const fileInput = document.getElementById('imageInput');
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            // Show loading
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('resultContainer').style.display = 'none';
+
+            // Create form data
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch('/colorize', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+
+                // Update result image with timestamp to prevent caching
+                document.getElementById('comparisonImage').src = data.comparison_path + '?t=' + new Date().getTime();
+                document.getElementById('terrainType').textContent = data.terrain_type;
+                document.getElementById('downloadResult').href = data.result_path;
+                document.getElementById('downloadComparison').href = data.comparison_path;
+                document.getElementById('resultContainer').style.display = 'block';
+                
+            } catch (error) {
+                alert('Error processing image: ' + error);
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        });
+
+        // Preview input image when selected
+        document.getElementById('imageInput').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                // Hide previous results when new file is selected
+                document.getElementById('resultContainer').style.display = 'none';
+            }
+        });
+    </script>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
