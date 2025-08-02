@@ -34,3 +34,10 @@ SAR_Literature_Review.xlsx
 terrain_classifier_checkpoints/
 ROIs1868_summer_s1_59_p8_colorized_comparison.jpg
 random_terrain_comparison.jpg
+venv/
+frontend/
+node_modules/
+*.pyc
+.env
+.vscode/
+.idea/
