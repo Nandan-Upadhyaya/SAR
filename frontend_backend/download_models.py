@@ -7,11 +7,11 @@ load_dotenv()
 MODELS = {
     "classifier": {
         "url": os.getenv("CLASSIFIER_URL"),
-        "path": "models/classifier.pt"
+        "path": "models/classifier.pth"
     },
     "gan": {
         "url": os.getenv("GAN_URL"),
-        "path": "models/gan_model.pt"
+        "path": "models/gan_model.pth"
     }
 }
 

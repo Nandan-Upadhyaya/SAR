@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import sys
 sys.path.append('..')
 from SAR_UNET_PATCHGAN import IMG_SIZE, DEVICE, TERRAIN_TYPES
+from download_models import download_models
+download_models()
 
 app = Flask(__name__)
 
@@ -109,13 +111,13 @@ class TerrainClassifier(nn.Module):
 def load_models():
     # Load Generator
     generator = Generator().to(DEVICE)
-    checkpoint = torch.load('../checkpoints/checkpoint_epoch_139.pth', map_location=DEVICE, weights_only=False)
+    checkpoint = torch.load('models/gan_model.pth', map_location=DEVICE, weights_only=False)
     generator.load_state_dict(checkpoint['generator_state_dict'])
     generator.eval()
     
     # Load TerrainClassifier
     terrain_classifier = TerrainClassifier().to(DEVICE)
-    terrain_classifier.load_state_dict(torch.load('../terrain_classifier_checkpoints/best_terrain_classifier.pth', map_location=DEVICE, weights_only=False))
+    terrain_classifier.load_state_dict(torch.load('models/classifier.pth', map_location=DEVICE, weights_only=False))
     terrain_classifier.eval()
     
     return generator, terrain_classifier
